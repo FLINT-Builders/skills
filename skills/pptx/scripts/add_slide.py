@@ -62,7 +62,8 @@ MINIMAL_SLIDE_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 SHARED_PART_TYPES = ("chart", "diagramData", "oleObject", "package")
 
 NOTES_SLIDE_TYPE_RE = re.compile(r"""Type=["'][^"']*/relationships/notesSlide["']""")
-RELATIONSHIP_RE = re.compile(r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL)
+RELATIONSHIP_RE = re.compile(r"<Relationship\b[^<>]*?(?:/>|>[^<]*</Relationship\s*>)")
+SLD_ID_TAG_RE = re.compile(r"<p:sldId\b[^<>]*>")
 
 SLIDE_ID_MIN = 256
 SLIDE_ID_MAX = 2147483647
@@ -183,9 +184,14 @@ def _precheck_registration(unpacked_dir: Path, after: str | None, dest: str) -> 
     if not after:
         return None
     after_rid = _rid_for_slide(unpacked_dir, after)
-    if not re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml):
+    if not _find_sld_id_tag(xml, after_rid):
         _die(f"{after} ({after_rid}) is not listed in <p:sldIdLst>")
     return after_rid
+
+
+def _find_sld_id_tag(xml: str, rid: str) -> re.Match[str] | None:
+    needle = f'r:id="{rid}"'
+    return next((m for m in SLD_ID_TAG_RE.finditer(xml) if needle in m.group(0)), None)
 
 
 def _register_slide(unpacked_dir: Path, dest: str, source_desc: str, after_rid: str | None) -> None:
@@ -244,7 +250,11 @@ def _find_slide_relationship(pres_rels: str, slide_name: str) -> str | None:
 
 def _get_next_slide_id(unpacked_dir: Path) -> int:
     pres_content = (unpacked_dir / "ppt" / "presentation.xml").read_text(encoding="utf-8")
-    used = {int(m) for m in re.findall(r'<p:sldId[^>]*\bid="(\d+)"', pres_content)}
+    used = {
+        int(m.group(1))
+        for tag in SLD_ID_TAG_RE.findall(pres_content)
+        if (m := re.search(r'\bid="(\d+)"', tag))
+    }
 
     candidate = max((i for i in used if i >= SLIDE_ID_MIN), default=SLIDE_ID_MIN - 1) + 1
     if candidate <= SLIDE_ID_MAX and candidate not in used:
@@ -266,7 +276,7 @@ def _insert_into_sld_id_lst(
         _die(f"presentation.xml already references {rid}; refusing to add a duplicate")
 
     if after_rid:
-        open_tag = re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml)
+        open_tag = _find_sld_id_tag(xml, after_rid)
         if not open_tag:
             _die(f"{after_rid} is not listed in <p:sldIdLst>")
         end = open_tag.end()
@@ -289,8 +299,10 @@ def _insert_into_sld_id_lst(
 
     pres_path.write_text(xml, encoding="utf-8")
 
-    lst = re.search(r"<p:sldIdLst>(.*)</p:sldIdLst>", xml, re.DOTALL)
-    entries = re.findall(r"<p:sldId\b[^>]*>", lst.group(1)) if lst else []
+    start = xml.find("<p:sldIdLst>")
+    end = xml.rfind("</p:sldIdLst>")
+    lst = xml[start + len("<p:sldIdLst>"):end] if -1 < start < end else ""
+    entries = SLD_ID_TAG_RE.findall(lst)
     position = next(
         (i for i, e in enumerate(entries, 1) if f'r:id="{rid}"' in e), len(entries)
     )
