@@ -2,8 +2,10 @@
 Base validator with common validation logic for document files.
 """
 
+import os
 import re
-from pathlib import Path
+import stat
+from pathlib import Path, PurePath
 
 import defusedxml.minidom
 from functools import lru_cache
@@ -20,6 +22,82 @@ def _load_schema(schema_path: str):
             xsd_file, parser=lxml.etree.XMLParser(), base_url=schema_path
         )
     return lxml.etree.XMLSchema(xsd_doc)
+
+
+def _scan_package(root: Path):
+    """List the package's regular files without following any symlink.
+
+    Returns package-relative POSIX names and the bytes of every .rels file.
+    Symlinks, junctions and special files are not package parts, and nothing
+    outside `root` is opened or stat'ed.
+    """
+    names = set()
+    rels_data = {}
+    use_fds = os.scandir in os.supports_fd and hasattr(os, "O_NOFOLLOW")
+    if use_fds:
+        nofollow = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        dir_flags = nofollow | getattr(os, "O_DIRECTORY", 0)
+        file_flags = nofollow | getattr(os, "O_NONBLOCK", 0)
+
+    def list_dir(handle):
+        with os.scandir(handle) as entries:
+            return iter(list(entries))
+
+    def read_regular(handle, entry):
+        if use_fds:
+            fd = os.open(entry.name, file_flags, dir_fd=handle)
+        else:
+            fd = os.open(entry.path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+            return fh.read()
+
+    root_handle = os.open(root, dir_flags) if use_fds else str(root)
+    try:
+        root_entries = list_dir(root_handle)
+    except BaseException:
+        if use_fds:
+            os.close(root_handle)
+        raise
+    stack = [(root_handle, "", root_entries)]
+    try:
+        while stack:
+            handle, prefix, entries = stack[-1]
+            entry = next(entries, None)
+            if entry is None:
+                stack.pop()
+                if use_fds:
+                    os.close(handle)
+                continue
+            name = prefix + entry.name
+            try:
+                is_junction = getattr(entry, "is_junction", lambda: False)()
+                if entry.is_dir(follow_symlinks=False) and not is_junction:
+                    if use_fds:
+                        child = os.open(entry.name, dir_flags, dir_fd=handle)
+                    else:
+                        child = entry.path
+                    try:
+                        stack.append((child, name + "/", list_dir(child)))
+                    except OSError:
+                        if use_fds:
+                            os.close(child)
+                        raise
+                elif entry.is_file(follow_symlinks=False) and not is_junction:
+                    if name.endswith(".rels"):
+                        data = read_regular(handle, entry)
+                        if data is None:
+                            continue
+                        rels_data[name] = data
+                    names.add(name)
+            except OSError:
+                continue
+    finally:
+        if use_fds:
+            for handle, _prefix, _entries in stack:
+                os.close(handle)
+    return names, rels_data
 
 class BaseSchemaValidator:
 
@@ -307,40 +385,59 @@ class BaseSchemaValidator:
                 print("PASSED - All required IDs are unique")
             return True
 
+    def _target_part_name(self, target, rels_name):
+        """Map a relationship target to a package-relative part name.
+
+        Resolution is lexical only, so the host filesystem is never consulted.
+        Returns None when the target lands outside the unpacked package.
+        """
+        root = str(self.unpacked_dir)
+        if target.startswith("/"):
+            joined = os.path.join(root, target.lstrip("/"))
+        elif PurePath(rels_name).name == ".rels":
+            joined = os.path.join(root, target)
+        else:
+            owner_dir = PurePath(rels_name).parent.parent
+            joined = os.path.join(root, owner_dir, target)
+        try:
+            relative = PurePath(os.path.normpath(joined)).relative_to(root)
+        except ValueError:
+            return None
+        if not relative.parts:
+            return None
+        return relative.as_posix()
+
     def validate_file_references(self):
         errors = []
 
-        rels_files = list(self.unpacked_dir.rglob("*.rels"))
+        package_files, rels_data = _scan_package(self.unpacked_dir)
 
-        if not rels_files:
+        if not rels_data:
             if self.verbose:
                 print("PASSED - No .rels files found")
             return True
 
-        all_files = []
-        for file_path in self.unpacked_dir.rglob("*"):
-            if (
-                file_path.is_file()
-                and file_path.name != "[Content_Types].xml"
-                and not file_path.name.endswith(".rels")
-            ):  
-                all_files.append(file_path.resolve())
+        all_files = {
+            name
+            for name in package_files
+            if PurePath(name).name != "[Content_Types].xml"
+            and not name.endswith(".rels")
+        }
 
         all_referenced_files = set()
 
         if self.verbose:
             print(
-                f"Found {len(rels_files)} .rels files and {len(all_files)} target files"
+                f"Found {len(rels_data)} .rels files and {len(all_files)} target files"
             )
 
-        for rels_file in rels_files:
+        for rels_name in sorted(rels_data):
+            rel_path = Path(rels_name)
             try:
-                rels_root = lxml.etree.parse(str(rels_file)).getroot()
+                rels_root = lxml.etree.fromstring(rels_data[rels_name])
 
-                rels_dir = rels_file.parent
-
-                referenced_files = set()
                 broken_refs = []
+                outside_refs = []
 
                 for rel in rels_root.findall(
                     ".//ns:Relationship",
@@ -352,41 +449,32 @@ class BaseSchemaValidator:
                     if target and not target.startswith(
                         ("http", "mailto:")
                     ):  
-                        if target.startswith("/"):
-                            target_path = self.unpacked_dir / target.lstrip("/")
-                        elif rels_file.name == ".rels":
-                            target_path = self.unpacked_dir / target
+                        part_name = self._target_part_name(target, rels_name)
+                        if part_name is None:
+                            outside_refs.append((target, rel.sourceline))
+                        elif part_name in package_files:
+                            all_referenced_files.add(part_name)
                         else:
-                            base_dir = rels_dir.parent
-                            target_path = base_dir / target
-
-                        try:
-                            target_path = target_path.resolve()
-                            if target_path.exists() and target_path.is_file():
-                                referenced_files.add(target_path)
-                                all_referenced_files.add(target_path)
-                            else:
-                                broken_refs.append((target, rel.sourceline))
-                        except (OSError, ValueError):
                             broken_refs.append((target, rel.sourceline))
 
-                if broken_refs:
-                    rel_path = rels_file.relative_to(self.unpacked_dir)
-                    for broken_ref, line_num in broken_refs:
-                        errors.append(
-                            f"  {rel_path}: Line {line_num}: Broken reference to {broken_ref}"
-                        )
+                for outside_ref, line_num in outside_refs:
+                    errors.append(
+                        f"  {rel_path}: Line {line_num}: Invalid reference to "
+                        f"{outside_ref} (resolves outside the package)"
+                    )
+                for broken_ref, line_num in broken_refs:
+                    errors.append(
+                        f"  {rel_path}: Line {line_num}: Broken reference to {broken_ref}"
+                    )
 
             except Exception as e:
-                rel_path = rels_file.relative_to(self.unpacked_dir)
                 errors.append(f"  Error parsing {rel_path}: {e}")
 
-        unreferenced_files = set(all_files) - all_referenced_files
+        unreferenced_files = all_files - all_referenced_files
 
         if unreferenced_files:
             for unref_file in sorted(unreferenced_files):
-                unref_rel_path = unref_file.relative_to(self.unpacked_dir)
-                errors.append(f"  Unreferenced file: {unref_rel_path}")
+                errors.append(f"  Unreferenced file: {Path(unref_file)}")
 
         if errors:
             print(f"FAILED - Found {len(errors)} relationship validation errors:")
