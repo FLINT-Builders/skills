@@ -14,18 +14,23 @@ No dependencies beyond the Python stdlib are required.
 
 import argparse
 import base64
+import hmac
+import html as html_lib
 import json
 import mimetypes
 import os
 import re
+import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Files to exclude from output listings
 METADATA_FILES = {"transcript.md", "user_notes.md", "metrics.json"}
@@ -252,8 +257,16 @@ def generate_html(
     skill_name: str,
     previous: dict[str, dict] | None = None,
     benchmark: dict | None = None,
+    review_token: str | None = None,
+    saved_feedback: dict | None = None,
 ) -> str:
-    """Generate the complete standalone HTML page with embedded data."""
+    """Generate the complete standalone HTML page with embedded data.
+
+    review_token is the server's per-session secret; the page sends it back
+    in the X-Review-Token header. Static pages have no server and no token.
+    saved_feedback is the current feedback.json, embedded so the page does not
+    have to GET /api/feedback (browsers omit Origin on same-origin GETs).
+    """
     template_path = Path(__file__).parent / "viewer.html"
     template = template_path.read_text()
 
@@ -275,8 +288,17 @@ def generate_html(
     }
     if benchmark:
         embedded["benchmark"] = benchmark
+    if saved_feedback is not None:
+        embedded["saved_feedback"] = saved_feedback
 
-    data_json = json.dumps(embedded)
+    # "</" only occurs inside JSON strings, where "<\/" decodes to the same text;
+    # escaping it keeps embedded text from closing the <script> element.
+    data_json = json.dumps(embedded).replace("</", "<\\/")
+
+    token_meta = ""
+    if review_token:
+        token_meta = f'<meta name="review-token" content="{html_lib.escape(review_token, quote=True)}">'
+    template = template.replace("<!--__REVIEW_TOKEN_META__-->", token_meta, 1)
 
     return template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};")
 
@@ -305,11 +327,35 @@ def _kill_port(port: int) -> None:
     except FileNotFoundError:
         print("Note: lsof not found, cannot check if port is in use", file=sys.stderr)
 
+REVIEW_TOKEN_HEADER = "X-Review-Token"
+_token_lock = threading.Lock()
+
+
+def server_review_token(server: object) -> str:
+    """Return the server instance's session token, creating it on first use."""
+    token = getattr(server, "review_token", None)
+    if token:
+        return token
+    with _token_lock:
+        token = getattr(server, "review_token", None)
+        if not token:
+            token = secrets.token_urlsafe(32)
+            server.review_token = token
+    return token
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     """Serves the review HTML and handles feedback saves.
 
     Regenerates the HTML on each page load so that refreshing the browser
     picks up new eval outputs without restarting the server.
+
+    /api/feedback only answers the page this server served: the request must
+    carry the session token in X-Review-Token (a custom header, so a
+    cross-site page cannot send it without a CORS preflight, which is never
+    approved), come from a loopback Origin on this port, and POSTs must be
+    application/json. The Host check keeps a DNS-rebound page from reading
+    the token out of the served HTML.
     """
 
     def __init__(
@@ -329,8 +375,57 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.benchmark_path = benchmark_path
         super().__init__(*args, **kwargs)
 
+    def _local_authorities(self) -> set[str]:
+        port = self.server.server_address[1]
+        authorities = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if port == 80:
+            authorities |= {"127.0.0.1", "localhost"}
+        return authorities
+
+    def _host_allowed(self) -> bool:
+        host = self.headers.get("Host", "").strip().lower()
+        return host in self._local_authorities()
+
+    def _feedback_request_allowed(self, *, require_json: bool) -> bool:
+        if not self._host_allowed():
+            return False
+
+        origin = self.headers.get("Origin")
+        allowed_origins = {f"http://{a}" for a in self._local_authorities()}
+        if origin is None or origin.strip().lower() not in allowed_origins:
+            return False
+
+        sent_token = self.headers.get(REVIEW_TOKEN_HEADER)
+        if not sent_token or not hmac.compare_digest(
+            sent_token.encode("utf-8", "replace"),
+            server_review_token(self.server).encode("utf-8"),
+        ):
+            return False
+
+        if require_json:
+            media_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            if media_type != "application/json":
+                return False
+
+        return True
+
+    def _send_json(self, status: int, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _forbid(self) -> None:
+        self.close_connection = True
+        self._send_json(403, b'{"error":"forbidden"}')
+
     def do_GET(self) -> None:
-        if self.path == "/" or self.path == "/index.html":
+        route = urlsplit(self.path).path
+        if route in ("/", "/index.html"):
+            if not self._host_allowed():
+                self._forbid()
+                return
             # Regenerate HTML on each request (re-scans workspace for new outputs)
             runs = find_runs(self.workspace)
             benchmark = None
@@ -339,43 +434,58 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     benchmark = json.loads(self.benchmark_path.read_text())
                 except (json.JSONDecodeError, OSError):
                     pass
-            html = generate_html(runs, self.skill_name, self.previous, benchmark)
+            saved_feedback = None
+            if self.feedback_path.exists():
+                try:
+                    loaded = json.loads(self.feedback_path.read_text())
+                    if isinstance(loaded, dict):
+                        saved_feedback = loaded
+                except (json.JSONDecodeError, OSError):
+                    pass
+            html = generate_html(
+                runs, self.skill_name, self.previous, benchmark,
+                review_token=server_review_token(self.server),
+                saved_feedback=saved_feedback,
+            )
             content = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.end_headers()
             self.wfile.write(content)
-        elif self.path == "/api/feedback":
+        elif route == "/api/feedback":
+            if not self._feedback_request_allowed(require_json=False):
+                self._forbid()
+                return
             data = b"{}"
             if self.feedback_path.exists():
                 data = self.feedback_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self._send_json(200, data)
         else:
             self.send_error(404)
 
     def do_POST(self) -> None:
-        if self.path == "/api/feedback":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length)
+        if urlsplit(self.path).path == "/api/feedback":
+            if not self._feedback_request_allowed(require_json=True):
+                self._forbid()
+                return
             try:
+                length = int(self.headers.get("Content-Length", 0))
+                if length < 0:
+                    raise ValueError("Invalid Content-Length")
+                body = self.rfile.read(length)
                 data = json.loads(body)
                 if not isinstance(data, dict) or "reviews" not in data:
                     raise ValueError("Expected JSON object with 'reviews' key")
                 self.feedback_path.write_text(json.dumps(data, indent=2) + "\n")
                 resp = b'{"ok":true}'
-                self.send_response(200)
+                status = 200
             except (json.JSONDecodeError, OSError, ValueError) as e:
                 resp = json.dumps({"error": str(e)}).encode()
-                self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp)))
-            self.end_headers()
-            self.wfile.write(resp)
+                status = 500
+            self._send_json(status, resp)
         else:
             self.send_error(404)
 
@@ -445,6 +555,7 @@ def main() -> None:
         # Port still in use after kill attempt — find a free one
         server = HTTPServer(("127.0.0.1", 0), handler)
         port = server.server_address[1]
+    server_review_token(server)
 
     url = f"http://localhost:{port}"
     print(f"\n  Eval Viewer")
