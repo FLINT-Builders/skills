@@ -158,7 +158,12 @@ def main():
                 rezip(unpacked_dir, packed_file)
                 print(f"Wrote repaired file to {packed_file}")
 
-    success = all([v.validate() for v in validators])
+    try:
+        success = all([v.validate() for v in validators])
+    finally:
+        for v in validators:
+            if hasattr(v, "cleanup"):
+                v.cleanup()
 
     if temp_dir_ctx is not None:
         temp_dir_ctx.cleanup()

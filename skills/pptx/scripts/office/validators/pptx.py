@@ -3,9 +3,8 @@ Validator for PowerPoint presentation XML files against XSD schemas.
 """
 
 import re
-from pathlib import Path
 
-from helpers import opc_target, rels_source_part, safe_extract
+from helpers import opc_target, rels_source_part
 
 from .base import BaseSchemaValidator
 
@@ -121,33 +120,23 @@ class PPTXSchemaValidator(BaseSchemaValidator):
         return True
 
     def _original_slide_defects(self, schema) -> set[str]:
-        import tempfile
-        import zipfile
-
         from helpers.pptx_slide import SLIDE_PART_RE, fatal_slide_errors
 
-        if self.original_file is None:
+        original_dir = self.unpacked_original()
+        if original_dir is None:
             return set()
 
         found: set[str] = set()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            try:
-                with zipfile.ZipFile(self.original_file, "r") as zf:
-                    safe_extract(zf, temp_path)
-            except (zipfile.BadZipFile, ValueError, OSError):
-                return set()  
-
-            for part in sorted(temp_path.rglob("*.xml")):
-                relative = part.relative_to(temp_path).as_posix()
-                if not SLIDE_PART_RE.fullmatch(relative):
-                    continue
-                ok, errors = self._validate_single_file_xsd(
-                    part.resolve(), temp_path.resolve(), schema_path=schema
-                )
-                if ok is None or ok or not errors:
-                    continue
-                found |= set(fatal_slide_errors(set(errors)))
+        for part in sorted(original_dir.rglob("*.xml")):
+            relative = part.relative_to(original_dir).as_posix()
+            if not SLIDE_PART_RE.fullmatch(relative):
+                continue
+            ok, errors = self._validate_single_file_xsd(
+                part.resolve(), original_dir, schema_path=schema
+            )
+            if ok is None or ok or not errors:
+                continue
+            found |= set(fatal_slide_errors(set(errors)))
         return found
 
     def validate_slides(self):
