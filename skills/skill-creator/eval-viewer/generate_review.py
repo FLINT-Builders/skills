@@ -247,6 +247,22 @@ def load_previous_iteration(workspace: Path) -> dict[str, dict]:
     return result
 
 
+def json_for_script(value: object) -> str:
+    """Serialize value as JSON that is safe to place inside an inline <script>.
+
+    The HTML parser ends a script element at any "</script", even inside a JS
+    string, and json.dumps leaves "<" and "/" as-is. Escaping "<", ">" and "&"
+    as \\uXXXX keeps the JSON equivalent while making "</script" and "<!--"
+    impossible in the output.
+    """
+    return (
+        json.dumps(value, ensure_ascii=True)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 def generate_html(
     runs: list[dict],
     skill_name: str,
@@ -276,7 +292,7 @@ def generate_html(
     if benchmark:
         embedded["benchmark"] = benchmark
 
-    data_json = json.dumps(embedded)
+    data_json = json_for_script(embedded)
 
     return template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};")
 
