@@ -1,3 +1,4 @@
+import io
 import os
 import posixpath
 import re
@@ -71,15 +72,84 @@ def rendered_text(text: str, preserve: bool) -> str:
     return text if preserve else text.strip(XML_SPACE)
 
 
+MAX_MEMBER_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_TOTAL_UNCOMPRESSED_BYTES = 12 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
+MAX_MEMBER_COUNT = 256
+_COPY_CHUNK = 64 * 1024
+
+
+def check_member_budget(info: zipfile.ZipInfo) -> None:
+    if info.file_size > MAX_MEMBER_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"archive entry {info.filename!r} expands to {info.file_size} bytes "
+            f"(limit {MAX_MEMBER_UNCOMPRESSED_BYTES})"
+        )
+    if info.file_size > MAX_COMPRESSION_RATIO * max(info.compress_size, 1):
+        raise ValueError(
+            f"archive entry {info.filename!r} compression ratio exceeds {MAX_COMPRESSION_RATIO}:1"
+        )
+
+
+def check_archive_budget(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    infos = zf.infolist()
+    if len(infos) > MAX_MEMBER_COUNT:
+        raise ValueError(f"archive has {len(infos)} entries (limit {MAX_MEMBER_COUNT})")
+    total = 0
+    for info in infos:
+        check_member_budget(info)
+        total += info.file_size
+    if total > MAX_TOTAL_UNCOMPRESSED_BYTES:
+        raise ValueError(
+            f"archive expands to {total} bytes (limit {MAX_TOTAL_UNCOMPRESSED_BYTES})"
+        )
+    return infos
+
+
+def open_member(zf: zipfile.ZipFile, name: str):
+    info = zf.getinfo(name)
+    check_member_budget(info)
+    return zf.open(info)
+
+
+def read_member(zf: zipfile.ZipFile, name: str) -> bytes:
+    info = zf.getinfo(name)
+    check_member_budget(info)
+    buf = io.BytesIO()
+    with zf.open(info) as src:
+        _copy_capped(src, buf, info.file_size, name)
+    return buf.getvalue()
+
+
+def _copy_capped(src, dst, limit: int, name: str) -> int:
+    written = 0
+    while chunk := src.read(min(_COPY_CHUNK, limit - written + 1)):
+        written += len(chunk)
+        if written > limit:
+            raise ValueError(f"archive entry {name!r} expands past its budget")
+        dst.write(chunk)
+    return written
+
+
 def safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
     dest = dest.resolve()
-    for m in zf.infolist():
+    planned: list[tuple[zipfile.ZipInfo, Path]] = []
+    for m in check_archive_budget(zf):
         if stat.S_ISLNK(m.external_attr >> 16):
             raise ValueError(f"symlink archive entry not allowed: {m.filename!r}")
         target = (dest / m.filename).resolve()
         if not target.is_relative_to(dest):
             raise ValueError(f"unsafe archive entry: {m.filename!r}")
-        zf.extract(m, dest)
+        planned.append((m, target))
+
+    remaining = MAX_TOTAL_UNCOMPRESSED_BYTES
+    for m, target in planned:
+        if m.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(m) as src, open(target, "wb") as dst:
+            remaining -= _copy_capped(src, dst, min(m.file_size, remaining), m.filename)
 
 
 def rezip(src_dir: Path, out_path: Path) -> None:
