@@ -51,7 +51,7 @@ def get_slides_in_sldidlst(unpacked_dir: Path) -> set[str]:
     rid_to_slide = _slide_rids(pres_rels_path, unpacked_dir)
 
     pres_content = pres_path.read_text(encoding="utf-8")
-    referenced_rids = set(re.findall(r'<p:sldId[^>]*r:id="([^"]+)"', pres_content))
+    referenced_rids = set(re.findall(r'<p:sldId[^<>]*r:id="([^"]+)"', pres_content))
 
     return {
         posixpath.basename(rid_to_slide[rid])
@@ -77,7 +77,7 @@ def remove_orphaned_slides(unpacked_dir: Path) -> list[str]:
 
     if on_disk and not any(s.name in referenced_slides for s in on_disk):
         listed = re.findall(
-            r'<p:sldId[^>]*r:id="([^"]+)"',
+            r'<p:sldId[^<>]*r:id="([^"]+)"',
             (unpacked_dir / "ppt" / "presentation.xml").read_text(encoding="utf-8")
             if (unpacked_dir / "ppt" / "presentation.xml").exists()
             else "",
