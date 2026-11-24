@@ -4,14 +4,9 @@ Validator for Word document XML files against XSD schemas.
 
 import random
 import re
-import tempfile
-import zipfile
-from pathlib import Path
 
 import defusedxml.minidom
 import lxml.etree
-
-from helpers import safe_extract
 
 from .base import BaseSchemaValidator
 
@@ -180,22 +175,21 @@ class DOCXSchemaValidator(BaseSchemaValidator):
         return count
 
     def count_paragraphs_in_original(self):
-        original = self.original_file
-        if original is None:
+        if self.original_file is None:
             return 0
 
         count = 0
 
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                with zipfile.ZipFile(original, "r") as zip_ref:
-                    safe_extract(zip_ref, Path(temp_dir))
+            original_dir = self.unpacked_original()
+            if original_dir is None:
+                raise self.original_unpack_error
 
-                doc_xml_path = temp_dir + "/word/document.xml"
-                root = lxml.etree.parse(doc_xml_path).getroot()
+            doc_xml_path = original_dir / "word" / "document.xml"
+            root = lxml.etree.parse(str(doc_xml_path)).getroot()
 
-                paragraphs = root.findall(f".//{{{self.WORD_2006_NAMESPACE}}}p")
-                count = len(paragraphs)
+            paragraphs = root.findall(f".//{{{self.WORD_2006_NAMESPACE}}}p")
+            count = len(paragraphs)
 
         except Exception as e:
             print(f"Error counting paragraphs in original document: {e}")

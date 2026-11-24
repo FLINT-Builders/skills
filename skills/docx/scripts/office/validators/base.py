@@ -3,6 +3,8 @@ Base validator with common validation logic for document files.
 """
 
 import re
+import tempfile
+import zipfile
 from pathlib import Path
 
 import defusedxml.minidom
@@ -107,6 +109,10 @@ class BaseSchemaValidator:
         self.unpacked_dir = Path(unpacked_dir).resolve()
         self.original_file = Path(original_file) if original_file else None
         self.verbose = verbose
+        self._original_tmp = None
+        self._original_dir = None
+        self._original_unpack_attempted = False
+        self.original_unpack_error = None
 
         self.schemas_dir = Path(__file__).parent.parent / "schemas"
 
@@ -120,6 +126,31 @@ class BaseSchemaValidator:
 
     def validate(self):
         raise NotImplementedError("Subclasses must implement the validate method")
+
+    def unpacked_original(self):
+        # Unpacked at most once per validator; a failed unpack is not retried,
+        # so per-part callers never re-read the whole archive.
+        if self.original_file is None:
+            return None
+        if not self._original_unpack_attempted:
+            self._original_unpack_attempted = True
+            tmp = tempfile.TemporaryDirectory()
+            try:
+                with zipfile.ZipFile(self.original_file, "r") as zip_ref:
+                    safe_extract(zip_ref, Path(tmp.name))
+            except (zipfile.BadZipFile, ValueError, OSError) as e:
+                self.original_unpack_error = e
+                tmp.cleanup()
+            else:
+                self._original_tmp = tmp
+                self._original_dir = Path(tmp.name).resolve()
+        return self._original_dir
+
+    def cleanup(self):
+        if self._original_tmp is not None:
+            self._original_tmp.cleanup()
+            self._original_tmp = None
+            self._original_dir = None
 
     def repair(self) -> int:
         return self.repair_whitespace_preservation()
@@ -810,34 +841,23 @@ class BaseSchemaValidator:
             return False, {str(e)}
 
     def _get_original_file_errors(self, xml_file, schema_path=None):
-        if self.original_file is None:
+        original_dir = self.unpacked_original()
+        if original_dir is None:
             return set()
-
-        import tempfile
-        import zipfile
 
         xml_file = Path(xml_file).resolve()
         unpacked_dir = self.unpacked_dir.resolve()
         relative_path = xml_file.relative_to(unpacked_dir)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        original_xml_file = original_dir / relative_path
 
-            try:
-                with zipfile.ZipFile(self.original_file, "r") as zip_ref:
-                    safe_extract(zip_ref, temp_path)
-            except (zipfile.BadZipFile, ValueError, OSError):
-                return set()
+        if not original_xml_file.exists():
+            return set()
 
-            original_xml_file = temp_path / relative_path
-
-            if not original_xml_file.exists():
-                return set()
-
-            is_valid, errors = self._validate_single_file_xsd(
-                original_xml_file, temp_path, schema_path=schema_path
-            )
-            return errors if errors else set()
+        is_valid, errors = self._validate_single_file_xsd(
+            original_xml_file, original_dir, schema_path=schema_path
+        )
+        return errors if errors else set()
 
     def _remove_template_tags_from_text_nodes(self, xml_doc):
         warnings = []
