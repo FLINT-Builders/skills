@@ -51,7 +51,7 @@ def get_slides_in_sldidlst(unpacked_dir: Path) -> set[str]:
     rid_to_slide = _slide_rids(pres_rels_path, unpacked_dir)
 
     pres_content = pres_path.read_text(encoding="utf-8")
-    referenced_rids = set(re.findall(r'<p:sldId[^>]*r:id="([^"]+)"', pres_content))
+    referenced_rids = set(re.findall(r'<p:sldId[^<>]*r:id="([^"]+)"', pres_content))
 
     return {
         posixpath.basename(rid_to_slide[rid])

@@ -64,6 +64,21 @@ def part_text(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
+def parse_part(data: bytes):
+    """Return the root element of an XML part, or None if it cannot be parsed.
+
+    Comments, CDATA and processing instructions never surface as elements, so
+    tag text hidden inside them cannot be mistaken for markup.
+    """
+    import defusedxml.ElementTree as ET
+    from defusedxml.common import DefusedXmlException
+
+    try:
+        return ET.fromstring(data)
+    except (ET.ParseError, DefusedXmlException, ValueError):
+        return None
+
+
 XML_SPACE = " \t\r\n"
 
 

@@ -8,61 +8,90 @@ author knows which was meant.
 from __future__ import annotations
 
 import re
-from typing import Mapping
+from typing import Container, Iterator, Mapping
+from xml.etree.ElementTree import Element
 
-from . import part_text
+from . import parse_part
 
 
 _CHART_PART_RE = re.compile(r"ppt/charts/chart\d+\.xml")
 
-_GROUPING_RE = re.compile(r"""<c:grouping\b[^>]*?\bval=["'](\w+)["']""")
-_DLBL_POS_RE = re.compile(r"""<c:dLblPos\b[^>]*?\bval=["'](\w+)["']""")
+CHART_NAMESPACES = frozenset({
+    "http://schemas.openxmlformats.org/drawingml/2006/chart",
+    "http://purl.oclc.org/ooxml/drawingml/chart",
+})
 
-def _strip_ext_lst(text: str) -> str:
-    out, cursor = [], 0
-    for lo, hi in _ext_lst_spans(text):
-        out.append(text[cursor:lo])
-        cursor = hi
-    out.append(text[cursor:])
-    return "".join(out)
+_WORD_RE = re.compile(r"\w+")
+_INT_RE = re.compile(r"-?\d+")
 
-_BAR_GROUP_RE = re.compile(r"<c:(bar3DChart|barChart)\b[^>]*(?<!/)>.*?</c:\1\s*>", re.DOTALL)
+
+def _chart_name(element: Element) -> str | None:
+    namespace, _, local = element.tag.rpartition("}")
+    return local if namespace[1:] in CHART_NAMESPACES else None
+
+
+def _outside_ext_lst(element: Element) -> Iterator[Element]:
+    stack = list(reversed(element))
+    while stack:
+        child = stack.pop()
+        if _chart_name(child) == "extLst":
+            continue
+        yield child
+        stack.extend(reversed(child))
+
+
+def _outermost(root: Element, names: Container[str]) -> Iterator[Element]:
+    # A group nested inside another is checked as part of the outer one, so
+    # no subtree is walked more than once.
+    stack = [root]
+    while stack:
+        element = stack.pop()
+        if _chart_name(element) in names:
+            yield element
+            continue
+        stack.extend(reversed(element))
+
+
+def _word_val(element: Element) -> str | None:
+    val = element.get("val")
+    return val if val is not None and _WORD_RE.fullmatch(val) else None
+
+
+BAR_GROUPS = frozenset({"bar3DChart", "barChart"})
 
 STACKED_GROUPINGS = frozenset({"stacked", "percentStacked"})
 ILLEGAL_ON_STACKED = frozenset({"outEnd"})
 LEGAL_ON_STACKED = ("ctr", "inEnd", "inBase")
 
 
-def _check_stacked_label_positions(part: str, xml: str) -> list[str]:
+def _check_stacked_label_positions(part: str, root: Element) -> list[str]:
     problems: list[str] = []
-    for match in _BAR_GROUP_RE.finditer(xml):
-        block = _strip_ext_lst(match.group(0))
-        group = match.group(1)
+    for chart_group in _outermost(root, BAR_GROUPS):
+        group = _chart_name(chart_group)
+        grouping = None
+        bad: list[str] = []
+        for element in _outside_ext_lst(chart_group):
+            name = _chart_name(element)
+            if name == "grouping" and grouping is None:
+                grouping = _word_val(element)
+            elif name == "dLblPos":
+                pos = _word_val(element)
+                if pos in ILLEGAL_ON_STACKED:
+                    bad.append(pos)
 
-        grouping = _GROUPING_RE.search(block)
-        if grouping is None or grouping.group(1) not in STACKED_GROUPINGS:
+        if grouping not in STACKED_GROUPINGS:
             continue
 
-        bad = [p for p in _DLBL_POS_RE.findall(block) if p in ILLEGAL_ON_STACKED]
         for pos in sorted(set(bad)):
             problems.append(
                 f'{part}: {bad.count(pos)} data label(s) use dLblPos="{pos}" on a '
-                f"{grouping.group(1)} {group}; PowerPoint allows only "
+                f"{grouping} {group}; PowerPoint allows only "
                 f"{', '.join(LEGAL_ON_STACKED)} there"
             )
     return problems
 
 
-
-_ANY_CHART_GROUP_RE = re.compile(r"<c:(\w+Chart)\b[^>]*(?<!/)>.*?</c:\1\s*>", re.DOTALL)
-
-_AXID_RE = re.compile(
-    r"""\s*<c:axId\b[^>]*?\bval=["'](-?\d+)["']\s*(?:/>|>\s*</c:axId\s*>)"""
-)
-
-_AXIS_DECL_RE = re.compile(
-    r"""<c:(catAx|valAx|serAx|dateAx)\b[^>]*(?<!/)>\s*<c:axId\b[^>]*?\bval=["'](-?\d+)["']"""
-)
+AXIS_KINDS = frozenset({"catAx", "valAx", "serAx", "dateAx"})
 
 AXID_LIMIT = {
     "barChart": 2, "lineChart": 2, "areaChart": 2, "scatterChart": 2,
@@ -79,10 +108,25 @@ AXID_MINIMUM = {
 }
 
 
-def _declared_axes(xml: str) -> dict[str, list[str]]:
+def _axis_id(element: Element) -> str | None:
+    if _chart_name(element) != "axId" or len(element) or (element.text or "").strip():
+        return None
+    val = element.get("val")
+    return val if val is not None and _INT_RE.fullmatch(val) else None
+
+
+def _declared_axes(root: Element) -> dict[str, list[str]]:
     axes: dict[str, list[str]] = {}
-    for kind, axid in _AXIS_DECL_RE.findall(xml):
-        axes.setdefault(kind, []).append(axid)
+    for element in root.iter():
+        kind = _chart_name(element)
+        if kind not in AXIS_KINDS or not len(element):
+            continue
+        first = element[0]
+        if _chart_name(first) != "axId":
+            continue
+        val = first.get("val")
+        if val is not None and _INT_RE.fullmatch(val):
+            axes.setdefault(kind, []).append(val)
     return axes
 
 
@@ -98,23 +142,23 @@ def _canonical_ids(axes: dict[str, list[str]], limit: int) -> list[str] | None:
     return ids
 
 
-def _undeclared_axes(kind: str, block: str, axes: dict[str, list[str]]) -> list[str] | None:
+def _undeclared_axes(kind: str, group: Element, axes: dict[str, list[str]]) -> list[str] | None:
     if kind not in AXID_LIMIT:
         return None
-    ids = _AXID_RE.findall(block)
+    ids = [i for i in map(_axis_id, group.iter()) if i is not None]
     declared = {i for group in axes.values() for i in group}
     if len([i for i in ids if i in declared]) >= 2:
         return None
     return ids
 
 
-def _check_chart_axis_references(part: str, xml: str) -> list[str]:
-    axes = _declared_axes(xml)
+def _check_chart_axis_references(part: str, root: Element) -> list[str]:
+    axes = _declared_axes(root)
     problems: list[str] = []
     declared = {i for group in axes.values() for i in group}
-    for match in _ANY_CHART_GROUP_RE.finditer(xml):
-        kind, block = match.group(1), match.group(0)
-        ids = _undeclared_axes(kind, block, axes)
+    for group in _outermost(root, AXID_LIMIT):
+        kind = _chart_name(group)
+        ids = _undeclared_axes(kind, group, axes)
         if ids is None:
             continue
         if not ids:
@@ -139,32 +183,16 @@ def _check_chart_axis_references(part: str, xml: str) -> list[str]:
     return problems
 
 
-def _ext_lst_spans(text: str) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    depth = 0
-    start = 0
-    for match in re.finditer(r"<(/?)c:extLst\b[^>]*?(/?)>", text):
-        closing, self_closing = match.group(1), match.group(2)
-        if self_closing:
-            continue
-        if closing:
-            depth -= 1
-            if depth == 0:
-                spans.append((start, match.end()))
-        else:
-            if depth == 0:
-                start = match.start()
-            depth += 1
-    return spans
-
-
 CHART_CHECKS = (_check_stacked_label_positions, _check_chart_axis_references)
 
 
 def find_chart_problems(files: Mapping[str, bytes]) -> list[str]:
     problems: list[str] = []
     for part in sorted(n for n in files if _CHART_PART_RE.fullmatch(n)):
-        xml = part_text(files[part])
+        root = parse_part(files[part])
+        if root is None:
+            problems.append(f"{part}: could not be parsed, so its chart checks did not run")
+            continue
         for check in CHART_CHECKS:
-            problems.extend(check(part, xml))
+            problems.extend(check(part, root))
     return problems
