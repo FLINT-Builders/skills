@@ -32,6 +32,9 @@ from typing import NoReturn
 import tempfile
 import zipfile
 from pathlib import Path
+from xml.parsers.expat import ExpatError
+
+import defusedxml.minidom
 
 from office.helpers import rezip, safe_extract
 
@@ -61,8 +64,7 @@ MINIMAL_SLIDE_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 SHARED_PART_TYPES = ("chart", "diagramData", "oleObject", "package")
 
-NOTES_SLIDE_TYPE_RE = re.compile(r"""Type=["'][^"']*/relationships/notesSlide["']""")
-RELATIONSHIP_RE = re.compile(r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL)
+NOTES_SLIDE_TYPE_SUFFIX = "/relationships/notesSlide"
 
 SLIDE_ID_MIN = 256
 SLIDE_ID_MAX = 2147483647
@@ -71,6 +73,31 @@ SLIDE_ID_MAX = 2147483647
 def _die(msg: str) -> NoReturn:
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _parse_rels(xml: str, name: str):
+    try:
+        return defusedxml.minidom.parseString(xml)
+    except ExpatError as e:
+        raise ValueError(f"{name} is not well-formed XML: {e}") from e
+
+
+def _remove_nodes(nodes) -> None:
+    # Node.removeChild searches the sibling list, so removing one at a time is
+    # quadratic in the number of siblings; rebuild each parent's list once.
+    by_parent: dict = {}
+    for node in nodes:
+        by_parent.setdefault(node.parentNode, set()).add(node)
+    for parent, doomed in by_parent.items():
+        kept = [child for child in parent.childNodes if child not in doomed]
+        parent.childNodes[:] = kept
+        for prev, nxt in zip([None, *kept], [*kept, None]):
+            if prev is not None:
+                prev.nextSibling = nxt
+            if nxt is not None:
+                nxt.previousSibling = prev
+        for node in doomed:
+            node.parentNode = node.previousSibling = node.nextSibling = None
 
 
 def get_next_slide_number(slides_dir: Path) -> int:
@@ -124,23 +151,30 @@ def duplicate_slide(unpacked_dir: Path, source: str, after: str | None = None) -
     dest = f"slide{next_num}.xml"
     after_rid = _precheck_registration(unpacked_dir, after, dest)
 
+    source_rels = rels_dir / f"{source}.rels"
+    rels_dom = None
+    if source_rels.exists():
+        rels_dom = _parse_rels(source_rels.read_text(encoding="utf-8"), str(source_rels))
+
     shutil.copy2(source_slide, slides_dir / dest)
 
-    source_rels = rels_dir / f"{source}.rels"
     shared_parts: list[str] = []
-    if source_rels.exists():
-        dest_rels = rels_dir / f"{dest}.rels"
-        shutil.copy2(source_rels, dest_rels)
-        rels_content = dest_rels.read_text(encoding="utf-8")
-        rels_content = RELATIONSHIP_RE.sub(
-            lambda m: "" if NOTES_SLIDE_TYPE_RE.search(m.group(0)) else m.group(0),
-            rels_content,
+    if rels_dom is not None:
+        kinds = set()
+        notes = []
+        for rel in rels_dom.getElementsByTagName("Relationship"):
+            rel_type = rel.getAttribute("Type")
+            if rel_type.endswith(NOTES_SLIDE_TYPE_SUFFIX):
+                notes.append(rel)
+                continue
+            _, sep, kind = rel_type.rpartition("/relationships/")
+            if sep:
+                kinds.add(kind)
+        _remove_nodes(notes)
+        (rels_dir / f"{dest}.rels").write_bytes(
+            rels_dom.toxml(encoding="UTF-8", standalone=True)
         )
-        dest_rels.write_text(rels_content, encoding="utf-8")
-        shared_parts = sorted({
-            t for t in re.findall(r'Type="[^"]*/relationships/(\w+)"', rels_content)
-            if t in SHARED_PART_TYPES
-        })
+        shared_parts = sorted(kinds & set(SHARED_PART_TYPES))
 
     _register_slide(unpacked_dir, dest, source, after_rid)
     if shared_parts:
@@ -183,7 +217,7 @@ def _precheck_registration(unpacked_dir: Path, after: str | None, dest: str) -> 
     if not after:
         return None
     after_rid = _rid_for_slide(unpacked_dir, after)
-    if not re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml):
+    if not re.search(rf'<p:sldId\b[^<>]*r:id="{re.escape(after_rid)}"[^<>]*>', xml):
         _die(f"{after} ({after_rid}) is not listed in <p:sldIdLst>")
     return after_rid
 
@@ -233,18 +267,17 @@ def _add_to_presentation_rels(unpacked_dir: Path, dest: str) -> str:
 
 
 def _find_slide_relationship(pres_rels: str, slide_name: str) -> str | None:
-    for m in re.finditer(r"<Relationship\b[^>]*>", pres_rels):
-        element = m.group(0)
-        if re.search(rf'Target="(?:/ppt/)?slides/{re.escape(slide_name)}"', element):
-            id_match = re.search(r'\bId="([^"]+)"', element)
-            if id_match:
-                return id_match.group(1)
+    targets = {f"slides/{slide_name}", f"/ppt/slides/{slide_name}"}
+    dom = _parse_rels(pres_rels, "presentation.xml.rels")
+    for rel in dom.getElementsByTagName("Relationship"):
+        if rel.getAttribute("Target") in targets and rel.getAttribute("Id"):
+            return rel.getAttribute("Id")
     return None
 
 
 def _get_next_slide_id(unpacked_dir: Path) -> int:
     pres_content = (unpacked_dir / "ppt" / "presentation.xml").read_text(encoding="utf-8")
-    used = {int(m) for m in re.findall(r'<p:sldId[^>]*\bid="(\d+)"', pres_content)}
+    used = {int(m) for m in re.findall(r'<p:sldId[^<>]*\bid="(\d+)"', pres_content)}
 
     candidate = max((i for i in used if i >= SLIDE_ID_MIN), default=SLIDE_ID_MIN - 1) + 1
     if candidate <= SLIDE_ID_MAX and candidate not in used:
@@ -266,7 +299,7 @@ def _insert_into_sld_id_lst(
         _die(f"presentation.xml already references {rid}; refusing to add a duplicate")
 
     if after_rid:
-        open_tag = re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml)
+        open_tag = re.search(rf'<p:sldId\b[^<>]*r:id="{re.escape(after_rid)}"[^<>]*>', xml)
         if not open_tag:
             _die(f"{after_rid} is not listed in <p:sldIdLst>")
         end = open_tag.end()
@@ -289,8 +322,13 @@ def _insert_into_sld_id_lst(
 
     pres_path.write_text(xml, encoding="utf-8")
 
-    lst = re.search(r"<p:sldIdLst>(.*)</p:sldIdLst>", xml, re.DOTALL)
-    entries = re.findall(r"<p:sldId\b[^>]*>", lst.group(1)) if lst else []
+    lst_start = xml.find("<p:sldIdLst>")
+    lst_end = xml.rfind("</p:sldIdLst>")
+    entries = (
+        re.findall(r"<p:sldId\b[^<>]*>", xml[lst_start + len("<p:sldIdLst>"):lst_end])
+        if lst_start != -1 and lst_end > lst_start
+        else []
+    )
     position = next(
         (i for i, e in enumerate(entries, 1) if f'r:id="{rid}"' in e), len(entries)
     )
@@ -353,7 +391,10 @@ def main() -> None:
     if target.is_dir():
         if args.output:
             parser.error("--output is only valid for .pptx/.potx input; a directory is modified in place")
-        add_slide(target, args.source, args.after)
+        try:
+            add_slide(target, args.source, args.after)
+        except ValueError as e:
+            _die(str(e))
     elif target.is_file() and target.suffix.lower() in (".pptx", ".potx"):
         try:
             add_slide_to_package(target, args.source, args.after, Path(args.output) if args.output else None)
