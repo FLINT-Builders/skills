@@ -363,9 +363,9 @@ Present the eval set to the user for review using the HTML template:
 
 1. Read the template from `assets/eval_review.html`
 2. Replace the placeholders:
-   - `__EVAL_DATA_PLACEHOLDER__` → the JSON array of eval items (no quotes around it — it's a JS variable assignment)
-   - `__SKILL_NAME_PLACEHOLDER__` → the skill's name
-   - `__SKILL_DESCRIPTION_PLACEHOLDER__` → the skill's current description
+   - `__EVAL_DATA_PLACEHOLDER__` → the JSON array of eval items (no quotes around it — it's a JS variable assignment). It sits inside a `<script>` element, so after `json.dumps` replace `<`, `>` and `&` with `\u003c`, `\u003e` and `\u0026`; otherwise a query containing `</script>` ends the script and runs whatever follows
+   - `__SKILL_NAME_PLACEHOLDER__` → the skill's name, HTML-escaped (e.g. `html.escape`)
+   - `__SKILL_DESCRIPTION_PLACEHOLDER__` → the skill's current description, HTML-escaped (e.g. `html.escape`)
 3. Write to a temp file (e.g., `/tmp/eval_review_<skill-name>.html`) and open it: `open /tmp/eval_review_<skill-name>.html`
 4. The user can edit queries, toggle should-trigger, add/remove entries, then click "Export Eval Set"
 5. The file downloads to `~/Downloads/eval_set.json` — check the Downloads folder for the most recent version in case there are multiple (e.g., `eval_set (1).json`)
