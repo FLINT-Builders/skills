@@ -4,6 +4,7 @@ Recalculates all formulas in an Excel file using LibreOffice
 """
 
 import contextlib
+import io
 import json
 import os
 import platform
@@ -19,11 +20,25 @@ from pathlib import Path
 from office.soffice import get_soffice_env, run_soffice
 
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 MACRO_FILENAME = "Module1.xba"
 SOFFICE_MISSING = "soffice not found on PATH; LibreOffice is required to recalculate"
 
 MAX_LOCATIONS = 100
+
+# Checked against zip metadata before any part is decompressed.
+MAX_ZIP_ENTRIES = 128
+MAX_TOTAL_UNCOMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 100
+MAX_ARCHIVE_BYTES = MAX_TOTAL_UNCOMPRESSED_BYTES + 1024 * 1024
+# zipfile bounds each read's output only for these; bzip2 and lzma inflate a
+# whole compressed chunk at once. OOXML packages use only these two.
+ALLOWED_COMPRESSION = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+# Rows and padded cells openpyxl may hand back per load. Sheet XML within the
+# byte budget holds far fewer real cells, but a few bytes can claim a distant
+# row or column that openpyxl fills in.
+MAX_SCANNED_CELLS = 20_000_000
 
 EXTERNAL_REF_RE = re.compile(r"""(?<![\w"\[])'?\[\d+\][^!"\[\]]*'?!""")
 
@@ -78,19 +93,118 @@ def setup_libreoffice_macro(profile_dir: Path, timeout=30):
     return url, None
 
 
+class WorkbookOverBudget(ValueError):
+    def __init__(self, filename, reason):
+        super().__init__(f"{filename} exceeds workbook limit: {reason}")
+
+
+def read_bounded_workbook(filename):
+    """Read the workbook once and return its bytes and entry names.
+
+    Raises WorkbookOverBudget when the archive is over budget, judged only
+    from zip metadata, so nothing has been decompressed. Parse the returned
+    bytes (through _copy_for_parsing), never the path again, so the archive
+    parsed is the one checked.
+    """
+    with open(filename, "rb") as fh:
+        data = fh.read(MAX_ARCHIVE_BYTES + 1)
+    if len(data) > MAX_ARCHIVE_BYTES:
+        raise WorkbookOverBudget(filename, f"file is larger than {MAX_ARCHIVE_BYTES} bytes")
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        infos = archive.infolist()
+
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise WorkbookOverBudget(
+            filename, f"{len(infos)} archive entries (max {MAX_ZIP_ENTRIES})"
+        )
+    total = 0
+    for info in infos:
+        if info.compress_type not in ALLOWED_COMPRESSION:
+            raise WorkbookOverBudget(
+                filename, f"{info.filename} uses zip compression method {info.compress_type}"
+            )
+        if info.file_size and (
+            info.compress_size == 0
+            or info.file_size > info.compress_size * MAX_COMPRESSION_RATIO
+        ):
+            raise WorkbookOverBudget(
+                filename, f"{info.filename} compresses more than {MAX_COMPRESSION_RATIO}:1"
+            )
+        total += info.file_size
+    if total > MAX_TOTAL_UNCOMPRESSED_BYTES:
+        raise WorkbookOverBudget(
+            filename, f"{total} bytes uncompressed (max {MAX_TOTAL_UNCOMPRESSED_BYTES})"
+        )
+    return data, [info.filename for info in infos]
+
+
+def _copy_for_parsing(data):
+    """Re-store checked workbook bytes so every entry's size is its real size.
+
+    Declared sizes can understate a deflate stream, and ZipFile.read(), which
+    openpyxl uses for several parts, inflates the whole stream before cutting
+    it to the declared size. Bounded reads stop at the declared size instead.
+
+    xl/styles.xml is left out: openpyxl builds objects for every style record,
+    around 150x the XML size, and nothing here reads styles.
+    """
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(out, "w") as dst:
+        for info in src.infolist():
+            if info.filename == "xl/styles.xml":
+                continue
+            with src.open(info) as fh:
+                payload = b"".join(iter(lambda: fh.read(64 * 1024), b""))
+            dst.writestr(info.filename, payload, zipfile.ZIP_STORED)
+    return out.getvalue()
+
+
+def _load_bounded(parse_copy, data_only):
+    # keep_links=False skips parsing the cached external workbooks; formulas
+    # and defined names still show the links.
+    return load_workbook(
+        io.BytesIO(parse_copy), read_only=True, data_only=data_only, keep_links=False
+    )
+
+
+def _iter_cell_values(wb, filename):
+    """Yield (sheet, coordinate, value) for each non-empty worksheet cell.
+
+    Each sheet's declared <dimension> is ignored, since openpyxl would pad
+    every row out to it. Rows are still padded to their last cell and missing
+    rows are filled in, so that work is capped at MAX_SCANNED_CELLS.
+    """
+    scanned = 0
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        if not hasattr(ws, "iter_rows"):
+            continue
+        ws.reset_dimensions()
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            scanned += len(row) or 1
+            if scanned > MAX_SCANNED_CELLS:
+                raise WorkbookOverBudget(
+                    filename, f"more than {MAX_SCANNED_CELLS} cells to scan"
+                )
+            for col_idx, value in enumerate(row, start=1):
+                if value is not None:
+                    yield sheet_name, f"{get_column_letter(col_idx)}{row_idx}", value
+
+
 def external_links_at_risk(filename):
     try:
-        with zipfile.ZipFile(filename) as archive:
-            names = archive.namelist()
+        data, names = read_bounded_workbook(filename)
     except (zipfile.BadZipFile, OSError):
         return []
     if not any(n.startswith("xl/externalLinks/") for n in names):
         return []
 
+    parse_copy = _copy_for_parsing(data)
     with contextlib.ExitStack() as stack:
-        formulas = load_workbook(filename, data_only=False)
+        formulas = _load_bounded(parse_copy, data_only=False)
         stack.callback(formulas.close)
-        values = load_workbook(filename, data_only=True)
+        values = _load_bounded(parse_copy, data_only=True)
         stack.callback(values.close)
 
         external_names = [
@@ -104,21 +218,22 @@ def external_links_at_risk(filename):
             else None
         )
 
-        at_risk = []
-        for sheet in formulas.sheetnames:
-            ws = formulas[sheet]
-            if not hasattr(ws, "iter_rows"):  
+        candidates = []
+        for sheet, coordinate, v in _iter_cell_values(formulas, filename):
+            if not (isinstance(v, str) and v.startswith("=")):
                 continue
-            cached = values[sheet]
-            for row in ws.iter_rows():
-                for cell in row:
-                    v = cell.value
-                    if not (isinstance(v, str) and v.startswith("=")):
-                        continue
-                    reaches_out = EXTERNAL_REF_RE.search(v) or (name_re and name_re.search(v))
-                    if reaches_out and cached[cell.coordinate].value is None:
-                        at_risk.append(f"{sheet}!{cell.coordinate}")
-        return at_risk
+            if EXTERNAL_REF_RE.search(v) or (name_re and name_re.search(v)):
+                candidates.append((sheet, coordinate))
+        if not candidates:
+            return []
+
+        wanted = set(candidates)
+        cached = {
+            (sheet, coordinate)
+            for sheet, coordinate, _ in _iter_cell_values(values, filename)
+            if (sheet, coordinate) in wanted
+        }
+        return [f"{s}!{c}" for s, c in candidates if (s, c) not in cached]
 
 
 def recalc(filename, timeout=30, force=False):
@@ -131,6 +246,13 @@ def recalc(filename, timeout=30, force=False):
         return {"error": f"{filename} is not writable; recalculation rewrites the file in place"}
 
     try:
+        read_bounded_workbook(abs_path)
+    except WorkbookOverBudget as e:
+        return {"error": str(e)}
+    except (zipfile.BadZipFile, OSError):
+        pass
+
+    try:
         get_soffice_env()
     except Exception as e:  
         return {"error": f"Could not prepare the LibreOffice environment: {e}"}
@@ -138,6 +260,8 @@ def recalc(filename, timeout=30, force=False):
     if not force:
         try:
             at_risk = external_links_at_risk(filename)
+        except WorkbookOverBudget as e:
+            return {"error": str(e)}
         except Exception as e:  
             return {"error": f"Could not inspect {filename} for external links: {e}"}
         if at_risk:
@@ -212,7 +336,9 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
         }
 
     try:
-        wb = load_workbook(filename, data_only=True)
+        data, _ = read_bounded_workbook(abs_path)
+        parse_copy = _copy_for_parsing(data)
+        wb = _load_bounded(parse_copy, data_only=True)
 
         excel_errors = [
             "#VALUE!",
@@ -226,19 +352,13 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
         error_details = {err: [] for err in excel_errors}
         total_errors = 0
 
-        for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            if not hasattr(ws, "iter_rows"):  
-                continue
-            for row in ws.iter_rows():
-                for cell in row:
-                    if cell.value is not None and isinstance(cell.value, str):
-                        for err in excel_errors:
-                            if err in cell.value:
-                                location = f"{sheet_name}!{cell.coordinate}"
-                                error_details[err].append(location)
-                                total_errors += 1
-                                break
+        for sheet_name, coordinate, value in _iter_cell_values(wb, filename):
+            if isinstance(value, str):
+                for err in excel_errors:
+                    if err in value:
+                        error_details[err].append(f"{sheet_name}!{coordinate}")
+                        total_errors += 1
+                        break
 
         result = {
             "status": "success" if total_errors == 0 else "errors_found",
@@ -255,20 +375,11 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
 
         wb.close()
 
-        wb_formulas = load_workbook(filename, data_only=False)
+        wb_formulas = _load_bounded(parse_copy, data_only=False)
         formula_count = 0
-        for sheet_name in wb_formulas.sheetnames:
-            ws = wb_formulas[sheet_name]
-            if not hasattr(ws, "iter_rows"):  
-                continue
-            for row in ws.iter_rows():
-                for cell in row:
-                    if (
-                        cell.value
-                        and isinstance(cell.value, str)
-                        and cell.value.startswith("=")
-                    ):
-                        formula_count += 1
+        for _, _, value in _iter_cell_values(wb_formulas, filename):
+            if isinstance(value, str) and value.startswith("="):
+                formula_count += 1
         wb_formulas.close()
 
         result["total_formulas"] = formula_count

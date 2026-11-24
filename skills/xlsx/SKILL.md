@@ -45,6 +45,10 @@ again. **JSON with an `error` key instead of a `status` means nothing was recalc
 only that case exits non-zero — `errors_found` exits 0, so never treat a clean exit as a clean
 workbook.
 
+`recalc.py` refuses, with an `error` containing `exceeds workbook limit`, any workbook over
+fixed size limits (more than 128 zip entries, 8 MiB uncompressed, or a part compressed more
+than 100:1). Tell the user the file is too large to recalculate here.
+
 **A green recalc proves your formulas *evaluate*, not that they are *right*.** An off-by-one
 range or a reference to the wrong row yields a clean, error-free file with wrong numbers.
 Write 2–3 formulas first and check they pull the values you expect, before building out a grid.
