@@ -26,6 +26,7 @@ SOFFICE_MISSING = "soffice not found on PATH; LibreOffice is required to recalcu
 MAX_LOCATIONS = 100
 
 EXTERNAL_REF_RE = re.compile(r"""(?<![\w"\[])'?\[\d+\][^!"\[\]]*'?!""")
+NAME_TOKEN_RE = re.compile(r"[\w.\\?]+")
 
 RECALCULATE_MACRO = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
@@ -93,16 +94,19 @@ def external_links_at_risk(filename):
         values = load_workbook(filename, data_only=True)
         stack.callback(values.close)
 
-        external_names = [
-            name
+        # Defined names are untrusted: look up formula tokens in a set rather than
+        # compiling the names into a regex alternation, whose cost is superlinear.
+        external_names = {
+            name.casefold()
             for name, dn in formulas.defined_names.items()
             if isinstance(getattr(dn, "value", None), str) and EXTERNAL_REF_RE.search(dn.value)
-        ]
-        name_re = (
-            re.compile(r"\b(" + "|".join(re.escape(n) for n in external_names) + r")\b")
-            if external_names
-            else None
-        )
+        }
+
+        def uses_external_name(formula):
+            return any(
+                tok.group().casefold() in external_names
+                for tok in NAME_TOKEN_RE.finditer(formula)
+            )
 
         at_risk = []
         for sheet in formulas.sheetnames:
@@ -113,9 +117,11 @@ def external_links_at_risk(filename):
             for row in ws.iter_rows():
                 for cell in row:
                     v = cell.value
-                    if not (isinstance(v, str) and v.startswith("=")):
+                    if cell.data_type != "f" or not isinstance(v, str):
                         continue
-                    reaches_out = EXTERNAL_REF_RE.search(v) or (name_re and name_re.search(v))
+                    reaches_out = EXTERNAL_REF_RE.search(v) or (
+                        external_names and uses_external_name(v)
+                    )
                     if reaches_out and cached[cell.coordinate].value is None:
                         at_risk.append(f"{sheet}!{cell.coordinate}")
         return at_risk
