@@ -9,6 +9,26 @@ import re
 import yaml
 from pathlib import Path
 
+# Real frontmatter is a few hundred to ~1,200 characters; parsing is only
+# bounded because both this cap and the alias ban below hold.
+MAX_FRONTMATTER_LENGTH = 16 * 1024
+
+
+class _NoAliasSafeLoader(yaml.SafeLoader):
+    """SafeLoader that refuses aliases, so a small document cannot expand
+    (via repeated or merged anchors) into a much larger object graph."""
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None,
+                "YAML aliases are not allowed in SKILL.md frontmatter",
+                event.start_mark,
+            )
+        return super().compose_node(parent, index)
+
+
 def validate_skill(skill_path):
     """Basic validation of a skill"""
     skill_path = Path(skill_path)
@@ -29,13 +49,18 @@ def validate_skill(skill_path):
         return False, "Invalid frontmatter format"
 
     frontmatter_text = match.group(1)
+    if len(frontmatter_text) > MAX_FRONTMATTER_LENGTH:
+        return False, (
+            f"Frontmatter is too long ({len(frontmatter_text)} characters). "
+            f"Maximum is {MAX_FRONTMATTER_LENGTH} characters."
+        )
 
     # Parse YAML frontmatter
     try:
-        frontmatter = yaml.safe_load(frontmatter_text)
+        frontmatter = yaml.load(frontmatter_text, Loader=_NoAliasSafeLoader)
         if not isinstance(frontmatter, dict):
             return False, "Frontmatter must be a YAML dictionary"
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, RecursionError, ValueError) as e:
         return False, f"Invalid YAML in frontmatter: {e}"
 
     # Define allowed properties
