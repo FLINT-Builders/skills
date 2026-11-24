@@ -329,7 +329,26 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.benchmark_path = benchmark_path
         super().__init__(*args, **kwargs)
 
+    def _host_allowed(self) -> bool:
+        # Binding to loopback does not stop DNS rebinding: a page on another
+        # origin can resolve its own hostname to 127.0.0.1 and read responses
+        # as same-origin. Only the exact hosts this server opens are accepted.
+        hosts = self.headers.get_all("Host") or []
+        if len(hosts) != 1:
+            return False
+        port = self.server.server_address[1]
+        return hosts[0] in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+    def _reject_host(self) -> bool:
+        if self._host_allowed():
+            return False
+        self.send_error(403)
+        self.close_connection = True
+        return True
+
     def do_GET(self) -> None:
+        if self._reject_host():
+            return
         if self.path == "/" or self.path == "/index.html":
             # Regenerate HTML on each request (re-scans workspace for new outputs)
             runs = find_runs(self.workspace)
@@ -359,6 +378,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self) -> None:
+        if self._reject_host():
+            return
         if self.path == "/api/feedback":
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
