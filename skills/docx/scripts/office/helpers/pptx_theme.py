@@ -11,19 +11,16 @@ import posixpath
 import re
 from typing import Mapping
 
-from . import part_text
+from . import parse_part
 
 THEME_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
+_RELATIONSHIP = "{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"
 
 _MASTER_RE = re.compile(
     r"^ppt/(?P<group>slideMasters|notesMasters|handoutMasters)/"
     r"(?:slide|notes|handout)Master(?P<num>\d+)\.xml$"
 )
 _GROUP_ORDER = {"slideMasters": 0, "notesMasters": 1, "handoutMasters": 2}
-
-_RELATIONSHIP_RE = re.compile(
-    r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL
-)
 
 
 def _sort_key(name: str) -> tuple[int, int]:
@@ -49,13 +46,16 @@ def _theme_rel(files: Mapping[str, bytes], master: str):
     rels = files.get(rels_path)
     if rels is None:
         return None
-    for element in _RELATIONSHIP_RE.findall(part_text(rels)):
-        if f'Type="{THEME_REL_TYPE}"' not in element:
+    root = parse_part(rels)
+    if root is None:
+        return None
+    for element in root.iter(_RELATIONSHIP):
+        if element.get("Type") != THEME_REL_TYPE:
             continue
-        target = re.search(r'\bTarget="([^"]+)"', element)
-        if target is None:
+        target = element.get("Target")
+        if not target:
             continue
-        return rels_path, element, _resolve(rels_path, target.group(1))
+        return rels_path, element, _resolve(rels_path, target)
     return None
 
 
@@ -65,18 +65,21 @@ def _masters(files: Mapping[str, bytes]) -> list[str]:
 
 _PRESENTATION = "ppt/presentation.xml"
 _NOTES_MASTERS = "ppt/notesMasters/"
-_IGNORABLE_RE = re.compile(r"<!--.*?-->|<\?.*?\?>", re.DOTALL)
-_AFTER_SLDIDLST_RE = re.compile(
-    r"<p:sldIdLst\b(?:[^>]*/>|[^>]*>.*?</p:sldIdLst\s*>)\s*(<[^>\s/]+)", re.DOTALL
-)
+_PML = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 
 def _notes_master_share_is_inert(files: Mapping[str, bytes]) -> bool:
     data = files.get(_PRESENTATION)
     if data is None:
         return False
-    match = _AFTER_SLDIDLST_RE.search(_IGNORABLE_RE.sub("", part_text(data)))
-    return match is not None and match.group(1) == "<p:notesMasterIdLst"
+    root = parse_part(data)
+    if root is None:
+        return False
+    children = list(root)
+    for index, child in enumerate(children[:-1]):
+        if child.tag == f"{_PML}sldIdLst":
+            return children[index + 1].tag == f"{_PML}notesMasterIdLst"
+    return False
 
 
 def _shares(files: Mapping[str, bytes]):
