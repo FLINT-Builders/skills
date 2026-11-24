@@ -590,12 +590,15 @@ qpdf --replace-input corrupted.pdf
 ```python
 # Fallback to OCR for scanned PDFs
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 
 def extract_text_with_ocr(pdf_path):
-    images = convert_from_path(pdf_path)
+    # One page at a time with a capped long side: page count and page
+    # dimensions come from the PDF itself
+    page_count = pdfinfo_from_path(pdf_path)["Pages"]
     text = ""
-    for i, image in enumerate(images):
+    for page in range(1, page_count + 1):
+        image = convert_from_path(pdf_path, first_page=page, last_page=page, size=3000)[0]
         text += pytesseract.image_to_string(image)
     return text
 ```

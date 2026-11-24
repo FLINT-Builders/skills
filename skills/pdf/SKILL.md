@@ -234,15 +234,17 @@ pdftk input.pdf rotate 1east output rotated.pdf
 ```python
 # Requires: pip install pytesseract pdf2image
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 
-# Convert PDF to images
-images = convert_from_path('scanned.pdf')
+# Render one page at a time with a capped long side (size=), since page
+# count and page dimensions come from the PDF itself
+page_count = pdfinfo_from_path('scanned.pdf')["Pages"]
 
 # OCR each page
 text = ""
-for i, image in enumerate(images):
-    text += f"Page {i+1}:\n"
+for page in range(1, page_count + 1):
+    image = convert_from_path('scanned.pdf', first_page=page, last_page=page, size=3000)[0]
+    text += f"Page {page}:\n"
     text += pytesseract.image_to_string(image)
     text += "\n\n"
 
