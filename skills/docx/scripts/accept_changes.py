@@ -7,14 +7,12 @@ import argparse
 import logging
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from office.soffice import get_soffice_env
 
 logger = logging.getLogger(__name__)
-
-LIBREOFFICE_PROFILE = "/tmp/libreoffice_docx_profile"
-MACRO_DIR = f"{LIBREOFFICE_PROFILE}/user/basic/Standard"
 
 ACCEPT_CHANGES_MACRO = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
@@ -52,13 +50,30 @@ def accept_changes(
     except Exception as e:
         return None, f"Error: Failed to copy input file to output location: {e}"
 
-    if not _setup_libreoffice_macro():
+    # The profile holds the Basic macro soffice runs, so it must be private to
+    # this run: a shared or predictable path lets another local user plant one.
+    with tempfile.TemporaryDirectory(
+        prefix="lo_docx_profile_", ignore_cleanup_errors=True
+    ) as profile_dir:
+        return _accept_changes_with_profile(
+            input_file, output_file, output_path, Path(profile_dir)
+        )
+
+
+def _accept_changes_with_profile(
+    input_file: str,
+    output_file: str,
+    output_path: Path,
+    profile_dir: Path,
+) -> tuple[None, str]:
+    profile_url = _setup_libreoffice_macro(profile_dir)
+    if profile_url is None:
         return None, "Error: Failed to setup LibreOffice macro"
 
     cmd = [
         "soffice",
         "--headless",
-        f"-env:UserInstallation=file://{LIBREOFFICE_PROFILE}",
+        f"-env:UserInstallation={profile_url}",
         "--norestore",
         "vnd.sun.star.script:Standard.Module1.AcceptAllTrackedChanges?language=Basic&location=application",
         str(output_path.absolute()),
@@ -88,19 +103,14 @@ def accept_changes(
     )
 
 
-def _setup_libreoffice_macro() -> bool:
-    macro_dir = Path(MACRO_DIR)
-    macro_file = macro_dir / "Module1.xba"
-
-    if macro_file.exists() and "AcceptAllTrackedChanges" in macro_file.read_text():
-        return True
-
-    if not macro_dir.exists():
+def _setup_libreoffice_macro(profile_dir: Path) -> str | None:
+    profile_url = profile_dir.as_uri()
+    try:
         subprocess.run(
             [
                 "soffice",
                 "--headless",
-                f"-env:UserInstallation=file://{LIBREOFFICE_PROFILE}",
+                f"-env:UserInstallation={profile_url}",
                 "--terminate_after_init",
             ],
             capture_output=True,
@@ -108,14 +118,18 @@ def _setup_libreoffice_macro() -> bool:
             check=False,
             env=get_soffice_env(),
         )
-        macro_dir.mkdir(parents=True, exist_ok=True)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Failed to create LibreOffice profile: {e}")
+        return None
 
+    macro_dir = profile_dir / "user" / "basic" / "Standard"
     try:
-        macro_file.write_text(ACCEPT_CHANGES_MACRO)
-        return True
-    except Exception as e:
+        macro_dir.mkdir(parents=True, exist_ok=True)
+        (macro_dir / "Module1.xba").write_text(ACCEPT_CHANGES_MACRO)
+    except OSError as e:
         logger.warning(f"Failed to setup LibreOffice macro: {e}")
-        return False
+        return None
+    return profile_url
 
 
 if __name__ == "__main__":
