@@ -20,11 +20,12 @@ Paths are relative to this skill's directory. Everything else is plain Python, `
 
 | Script | What it does |
 |---|---|
-| `scripts/thumbnail.py deck.pptx [prefix]` | Labeled grid of every slide, for picking template layouts. `.pptx` only. Pass `prefix` — it defaults to `thumbnails`, which overwrites the grids of any other deck done in the same directory |
+| `scripts/thumbnail.py deck.pptx [prefix]` | Labeled grid of every slide, for picking template layouts. `.pptx` only, up to 30 slides. Pass `prefix` — it defaults to `thumbnails`, which overwrites the grids of any other deck done in the same directory |
 | `scripts/add_slide.py unpacked/ slide2.xml [--after slideN.xml]` | Duplicate a slide (or a `slideLayoutN.xml`) with all the package bookkeeping. Also takes a `.pptx` directly with `-o out.pptx` |
 | `scripts/clean.py unpacked/` | Delete slides, media, and rels no longer referenced. Run **after** `<p:sldIdLst>` is final |
 | `scripts/office/validate.py deck.pptx [--original src.pptx]` | Schema, relationship, content-type, chart and slide checks; each failure names its fix. Pass `--original` for any template-derived deck — it baselines the schema checks against the template, so the template's own XSD errors don't read as yours |
-| `scripts/office/soffice.py --headless --convert-to pdf deck.pptx` | LibreOffice wrapper — bare `soffice` hangs in this sandbox |
+| `scripts/office/preview.py deck.pptx slide --dpi 150 [--pages 31-45]` | Render up to 30 slides to `slide-N.jpg` for visual QA; refuses oversized decks before writing anything |
+| `scripts/office/soffice.py --headless --convert-to pptx deck.ppt` | LibreOffice wrapper — bare `soffice` hangs in this sandbox |
 
 ## Creating with pptxgenjs — gotchas
 
@@ -51,7 +52,7 @@ Paths are relative to this skill's directory. Everything else is plain Python, `
 
 ## Editing existing decks and templates
 
-Pick layouts first: `python scripts/thumbnail.py template.pptx template-thumbs` writes a labeled grid of every slide and prints the file(s) it created — `template-thumbs.jpg`, split into `template-thumbs-N.jpg` past 12 slides. **Always pass that second argument, named after the deck.** It defaults to `thumbnails`, so two decks thumbnailed in one directory silently overwrite each other's grids — the first deck's are simply gone (template analysis only — visual QA needs the full-resolution renders from [Converting to Images](#converting-to-images); it only accepts `.pptx`, so copy a `.potx` to a `.pptx` name first). Use it with `markitdown` to map each content section onto a template slide, and vary the layouts — don't put every section on the same title-and-bullets slide.
+Pick layouts first: `python scripts/thumbnail.py template.pptx template-thumbs` writes a labeled grid of every slide and prints the file(s) it created — `template-thumbs.jpg`, split into `template-thumbs-N.jpg` past 12 slides. It refuses decks over 30 slides or with slides over 22 in on a side; for a longer template, look at it in ranges with `scripts/office/preview.py template.pptx template-slide --pages 31-60`. **Always pass that second argument, named after the deck.** It defaults to `thumbnails`, so two decks thumbnailed in one directory silently overwrite each other's grids — the first deck's are simply gone (template analysis only — visual QA needs the full-resolution renders from [Converting to Images](#converting-to-images); it only accepts `.pptx`, so copy a `.potx` to a `.pptx` name first). Use it with `markitdown` to map each content section onto a template slide, and vary the layouts — don't put every section on the same title-and-bullets slide.
 
 ```bash
 python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall('unpacked')" deck.pptx
@@ -223,15 +224,15 @@ Convert the slides to images (see [Converting to Images](#converting-to-images))
 Convert presentations to individual slide images for visual inspection:
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
 rm -f slide-*.jpg
-pdftoppm -jpeg -r 150 output.pdf slide
-ls -1 "$PWD"/slide-*.jpg
+python scripts/office/preview.py output.pptx slide --dpi 150
 ```
 
-**Pass the absolute paths printed above directly to the view tool.** The `rm` clears stale images from prior runs. `pdftoppm` zero-pads based on page count: `slide-1.jpg` for decks under 10 pages, `slide-01.jpg` for 10-99, `slide-001.jpg` for 100+.
+**Pass the absolute paths printed above directly to the view tool.** The `rm` clears stale images from prior runs. Slide numbers are zero-padded to the width of the last slide rendered: `slide-1.jpg` up to slide 9, `slide-01.jpg` for 10-30.
 
-**After fixes, rerun all four commands above** — the PDF must be regenerated from the edited `.pptx` before `pdftoppm` can reflect your changes.
+The preview renders at most 30 slides per run, at most 150 DPI, and only slides up to 22 in on a side. It exits with an error and writes nothing when a deck is over a limit. For a longer deck, or to re-render only the slides you fixed, pass `--pages`, e.g. `--pages 31-45` writes `slide-31.jpg`…`slide-45.jpg`. Don't bypass the limits by calling `soffice` and `pdftoppm` directly: a deck's slide count and slide size can fill the disk when every slide is rasterized.
+
+**After fixes, rerun both commands above** — the preview re-renders from the edited `.pptx`.
 
 ## Dependencies
 

@@ -37,12 +37,11 @@ A `.docx` is a ZIP archive of XML files. Choose your approach by task:
 After writing a `.docx`, render it and look at it:
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.docx
-pdftoppm -jpeg -r 100 output.pdf page
-ls page-*.jpg   # then Read the images
+rm -f page-*.jpg
+python scripts/office/preview.py output.docx page   # prints each page-N.jpg path; then Read the images
 ```
 
-`pdftoppm` zero-pads page numbers to the width of the page count (`page-01.jpg`…`page-12.jpg`).
+Page numbers are zero-padded to the width of the last page rendered (`page-01.jpg`…`page-12.jpg`). The preview renders at 100 DPI, at most 30 pages per run, and only pages up to 22 in on a side. It exits with an error and writes nothing when a document is over a limit. For a longer document, render the pages you need to check with `--pages`, e.g. `--pages 31-45` writes `page-31.jpg`…`page-45.jpg`. Don't bypass the limits by calling `soffice` and `pdftoppm` directly: a document's page count and page size can fill the disk when every page is rasterized.
 
 ## Editing existing documents
 
