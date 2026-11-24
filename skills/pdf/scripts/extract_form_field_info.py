@@ -2,17 +2,32 @@ import json
 import sys
 
 from pypdf import PdfReader
+from pypdf.generic import IndirectObject
 
 
+
+
+def _object_key(node, obj):
+    ref = node if isinstance(node, IndirectObject) else getattr(obj, "indirect_reference", None)
+    if ref is not None:
+        return ("ref", ref.idnum, ref.generation)
+    return ("direct", id(obj))
 
 
 def get_full_annotation_field_id(annotation):
+    # /Parent links come from the PDF, so a malformed or hostile file can loop.
     components = []
+    seen = set()
     while annotation:
-        field_name = annotation.get('/T')
+        obj = annotation.get_object()
+        key = _object_key(annotation, obj)
+        if key in seen:
+            raise ValueError("cyclic /Parent chain in form field annotation")
+        seen.add(key)
+        field_name = obj.get('/T')
         if field_name:
             components.append(field_name)
-        annotation = annotation.get('/Parent')
+        annotation = obj.get('/Parent')
     return ".".join(reversed(components)) if components else None
 
 
