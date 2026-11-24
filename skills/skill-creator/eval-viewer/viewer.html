@@ -844,14 +844,78 @@
             container.appendChild(sheetLabel);
           }
 
-          const htmlStr = XLSX.utils.sheet_to_html(ws, { editable: false });
           const wrapper = document.createElement("div");
-          wrapper.innerHTML = htmlStr;
+          wrapper.appendChild(buildSheetTable(ws));
           container.appendChild(wrapper);
         }
       } catch (err) {
         container.textContent = "Error rendering spreadsheet: " + err.message;
       }
+    }
+
+    // Spreadsheet contents are untrusted: never route them through
+    // sheet_to_html/innerHTML, which would honor cell HTML and link targets.
+    function buildSheetTable(ws) {
+      const table = document.createElement("table");
+      if (!ws || !ws["!ref"]) return table;
+      const range = XLSX.utils.decode_range(ws["!ref"]);
+      const merges = ws["!merges"] || [];
+      const covered = new Set();
+      const spans = new Map();
+      for (const m of merges) {
+        spans.set(m.s.r + ":" + m.s.c, { rows: m.e.r - m.s.r + 1, cols: m.e.c - m.s.c + 1 });
+        for (let r = m.s.r; r <= m.e.r; r++) {
+          for (let c = m.s.c; c <= m.e.c; c++) {
+            if (r !== m.s.r || c !== m.s.c) covered.add(r + ":" + c);
+          }
+        }
+      }
+
+      for (let r = range.s.r; r <= range.e.r; r++) {
+        const tr = document.createElement("tr");
+        for (let c = range.s.c; c <= range.e.c; c++) {
+          const key = r + ":" + c;
+          if (covered.has(key)) continue;
+          const td = document.createElement("td");
+          const span = spans.get(key);
+          if (span) {
+            if (span.rows > 1) td.rowSpan = span.rows;
+            if (span.cols > 1) td.colSpan = span.cols;
+          }
+          const cell = ws[XLSX.utils.encode_cell({ r, c })];
+          if (cell) {
+            const text = XLSX.utils.format_cell(cell);
+            const href = cell.l ? safeHttpUrl(cell.l.Target) : null;
+            if (href) {
+              const a = document.createElement("a");
+              a.href = href;
+              a.target = "_blank";
+              a.rel = "noopener noreferrer";
+              a.textContent = text;
+              td.appendChild(a);
+            } else {
+              td.textContent = text;
+            }
+          }
+          tr.appendChild(td);
+        }
+        table.appendChild(tr);
+      }
+      return table;
+    }
+
+    // Returns the parsed, re-serialized URL so the value checked is the value
+    // the anchor navigates to; anything that is not absolute http(s) is dropped.
+    function safeHttpUrl(target) {
+      if (typeof target !== "string") return null;
+      let url;
+      try {
+        url = new URL(target);
+      } catch (e) {
+        return null;
+      }
+      if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+      return url.href;
     }
 
     // ---- Grades ----
