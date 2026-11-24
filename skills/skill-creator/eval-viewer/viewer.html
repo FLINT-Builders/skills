@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--__REVIEW_TOKEN_META__-->
   <title>Eval Review</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -648,6 +649,17 @@
     // ---- Embedded data (injected by generate_review.py) ----
     /*__EMBEDDED_DATA__*/
 
+    // ---- Feedback API ----
+    const REVIEW_TOKEN = document.querySelector('meta[name="review-token"]')?.content || "";
+
+    function feedbackFetch(options = {}) {
+      const headers = { ...(options.headers || {}), "X-Review-Token": REVIEW_TOKEN };
+      return fetch("/api/feedback", { ...options, headers }).then((resp) => {
+        if (!resp.ok) throw new Error(`Feedback request failed: ${resp.status}`);
+        return resp;
+      });
+    }
+
     // ---- State ----
     let feedbackMap = {};  // run_id -> feedback text
     let currentIndex = 0;
@@ -662,13 +674,10 @@
       const hasPrevious = Object.keys(EMBEDDED_DATA.previous_feedback || {}).length > 0
         || Object.keys(EMBEDDED_DATA.previous_outputs || {}).length > 0;
       if (!hasPrevious) {
-        try {
-          const resp = await fetch("/api/feedback");
-          const data = await resp.json();
-          if (data.reviews) {
-            for (const r of data.reviews) feedbackMap[r.run_id] = r.feedback;
-          }
-        } catch { /* first run, no feedback yet */ }
+        const data = EMBEDDED_DATA.saved_feedback;
+        if (data && Array.isArray(data.reviews)) {
+          for (const r of data.reviews) feedbackMap[r.run_id] = r.feedback;
+        }
       }
 
       document.getElementById("skill-name").textContent = EMBEDDED_DATA.skill_name;
@@ -1009,7 +1018,7 @@
         }
       }
 
-      fetch("/api/feedback", {
+      feedbackFetch({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reviews, status: "in_progress" }),
@@ -1041,7 +1050,7 @@
         reviews.push({ run_id: r.id, feedback: feedbackMap[r.id] || "", timestamp: ts });
       }
       const payload = JSON.stringify({ reviews, status: "complete" }, null, 2);
-      fetch("/api/feedback", {
+      feedbackFetch({
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: payload,
