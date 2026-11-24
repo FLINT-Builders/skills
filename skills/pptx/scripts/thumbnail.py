@@ -25,7 +25,13 @@ from pathlib import Path
 
 import defusedxml.minidom
 from defusedxml import ElementTree
-from office.helpers import SLIDE_REL_TYPE, opc_target
+from office.helpers import (
+    SLIDE_REL_TYPE,
+    check_archive_budget,
+    open_member,
+    opc_target,
+    read_member,
+)
 from office.soffice import run_soffice
 from PIL import Image, ImageDraw, ImageFont
 
@@ -98,7 +104,7 @@ def main():
 
 def _is_hidden(zf: zipfile.ZipFile, part: str) -> bool:
     try:
-        with zf.open(part) as f:
+        with open_member(zf, part) as f:
             for _, root in ElementTree.iterparse(f, events=("start",)):
                 return root.get("show") in ("0", "false")  
     except (KeyError, ElementTree.ParseError):
@@ -108,7 +114,8 @@ def _is_hidden(zf: zipfile.ZipFile, part: str) -> bool:
 
 def get_slide_info(pptx_path: Path) -> list[dict]:
     with zipfile.ZipFile(pptx_path, "r") as zf:
-        rels_content = zf.read("ppt/_rels/presentation.xml.rels").decode("utf-8")
+        check_archive_budget(zf)
+        rels_content = read_member(zf, "ppt/_rels/presentation.xml.rels").decode("utf-8")
         rels_dom = defusedxml.minidom.parseString(rels_content)
 
         rid_to_part = {}
@@ -123,7 +130,7 @@ def get_slide_info(pptx_path: Path) -> list[dict]:
             if part is not None:
                 rid_to_part[rel.getAttribute("Id")] = part
 
-        pres_content = zf.read("ppt/presentation.xml").decode("utf-8")
+        pres_content = read_member(zf, "ppt/presentation.xml").decode("utf-8")
         pres_dom = defusedxml.minidom.parseString(pres_content)
 
         present = set(zf.namelist())
