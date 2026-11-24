@@ -7,16 +7,17 @@ author knows which was meant.
 
 from __future__ import annotations
 
+import bisect
 import re
-from typing import Mapping
+from typing import Iterator, Mapping
 
 from . import part_text
 
 
 _CHART_PART_RE = re.compile(r"ppt/charts/chart\d+\.xml")
 
-_GROUPING_RE = re.compile(r"""<c:grouping\b[^>]*?\bval=["'](\w+)["']""")
-_DLBL_POS_RE = re.compile(r"""<c:dLblPos\b[^>]*?\bval=["'](\w+)["']""")
+_GROUPING_RE = re.compile(r"""<c:grouping\b[^<>]*?\bval=["'](\w+)["']""")
+_DLBL_POS_RE = re.compile(r"""<c:dLblPos\b[^<>]*?\bval=["'](\w+)["']""")
 
 def _strip_ext_lst(text: str) -> str:
     out, cursor = [], 0
@@ -26,7 +27,36 @@ def _strip_ext_lst(text: str) -> str:
     out.append(text[cursor:])
     return "".join(out)
 
-_BAR_GROUP_RE = re.compile(r"<c:(bar3DChart|barChart)\b[^>]*(?<!/)>.*?</c:\1\s*>", re.DOTALL)
+_CHART_GROUP_OPEN_RE = re.compile(r"<c:(\w+Chart)\b[^<>]*(?<!/)>")
+_CHART_GROUP_CLOSE_RE = re.compile(r"</c:(\w+Chart)\s*>")
+
+
+def _chart_groups(xml: str, kinds: frozenset[str] | None = None) -> Iterator[tuple[str, str]]:
+    """Yield (kind, block) for each <c:*Chart> element not inside an earlier block.
+
+    A block runs from an opening tag to the next closing tag of the same kind.
+    Closing tags are indexed up front so that an unclosed opening tag costs a
+    lookup, not a scan of the rest of the part.
+    """
+    closes: dict[str, tuple[list[int], list[int]]] = {}
+    for m in _CHART_GROUP_CLOSE_RE.finditer(xml):
+        starts, ends = closes.setdefault(m.group(1), ([], []))
+        starts.append(m.start())
+        ends.append(m.end())
+    cursor = 0
+    for m in _CHART_GROUP_OPEN_RE.finditer(xml):
+        kind = m.group(1)
+        if m.start() < cursor or (kinds is not None and kind not in kinds):
+            continue
+        starts, ends = closes.get(kind, ([], []))
+        i = bisect.bisect_left(starts, m.end())
+        if i == len(starts):
+            continue
+        cursor = ends[i]
+        yield kind, xml[m.start():cursor]
+
+
+BAR_GROUP_KINDS = frozenset({"bar3DChart", "barChart"})
 
 STACKED_GROUPINGS = frozenset({"stacked", "percentStacked"})
 ILLEGAL_ON_STACKED = frozenset({"outEnd"})
@@ -35,9 +65,8 @@ LEGAL_ON_STACKED = ("ctr", "inEnd", "inBase")
 
 def _check_stacked_label_positions(part: str, xml: str) -> list[str]:
     problems: list[str] = []
-    for match in _BAR_GROUP_RE.finditer(xml):
-        block = _strip_ext_lst(match.group(0))
-        group = match.group(1)
+    for group, raw_block in _chart_groups(xml, BAR_GROUP_KINDS):
+        block = _strip_ext_lst(raw_block)
 
         grouping = _GROUPING_RE.search(block)
         if grouping is None or grouping.group(1) not in STACKED_GROUPINGS:
@@ -54,14 +83,12 @@ def _check_stacked_label_positions(part: str, xml: str) -> list[str]:
 
 
 
-_ANY_CHART_GROUP_RE = re.compile(r"<c:(\w+Chart)\b[^>]*(?<!/)>.*?</c:\1\s*>", re.DOTALL)
-
 _AXID_RE = re.compile(
-    r"""\s*<c:axId\b[^>]*?\bval=["'](-?\d+)["']\s*(?:/>|>\s*</c:axId\s*>)"""
+    r"""<c:axId\b[^<>]*?\bval=["'](-?\d+)["']\s*(?:/>|>\s*</c:axId\s*>)"""
 )
 
 _AXIS_DECL_RE = re.compile(
-    r"""<c:(catAx|valAx|serAx|dateAx)\b[^>]*(?<!/)>\s*<c:axId\b[^>]*?\bval=["'](-?\d+)["']"""
+    r"""<c:(catAx|valAx|serAx|dateAx)\b[^<>]*(?<!/)>\s*<c:axId\b[^<>]*?\bval=["'](-?\d+)["']"""
 )
 
 AXID_LIMIT = {
@@ -112,8 +139,7 @@ def _check_chart_axis_references(part: str, xml: str) -> list[str]:
     axes = _declared_axes(xml)
     problems: list[str] = []
     declared = {i for group in axes.values() for i in group}
-    for match in _ANY_CHART_GROUP_RE.finditer(xml):
-        kind, block = match.group(1), match.group(0)
+    for kind, block in _chart_groups(xml):
         ids = _undeclared_axes(kind, block, axes)
         if ids is None:
             continue
@@ -143,7 +169,7 @@ def _ext_lst_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     depth = 0
     start = 0
-    for match in re.finditer(r"<(/?)c:extLst\b[^>]*?(/?)>", text):
+    for match in re.finditer(r"<(/?)c:extLst\b[^<>]*?(/?)>", text):
         closing, self_closing = match.group(1), match.group(2)
         if self_closing:
             continue
