@@ -49,8 +49,7 @@ ls page-*.jpg   # then Read the images
 Legacy `.doc` files must be converted first: `python scripts/office/soffice.py --headless --convert-to docx file.doc`.
 
 ```bash
-unzip -q doc.docx -d unpacked/
-find unpacked -type l -delete   # strip symlink entries — docx from external parties is untrusted
+python3 -c "import sys,zipfile; from pathlib import Path; sys.path.insert(0,'scripts/office'); from helpers import safe_extract; safe_extract(zipfile.ZipFile(sys.argv[1]), Path('unpacked'))" doc.docx   # refuses symlinks, path escapes, and zip bombs — docx from external parties is untrusted
 python scripts/merge_runs.py unpacked/   # coalesce fragmented runs so text is findable
 # edit unpacked/word/document.xml in place — do NOT reformat or pretty-print
 (cd unpacked && rm -f ../out.docx && zip -Xr ../out.docx .)
