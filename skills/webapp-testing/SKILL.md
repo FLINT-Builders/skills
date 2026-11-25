@@ -41,6 +41,8 @@ To start a server, run `--help` first, then use the helper:
 python scripts/with_server.py --server "npm run dev" --port 5173 -- python your_automation.py
 ```
 
+The helper refuses to start if the port is already in use, and only treats a server as ready once a process it started accepts connections on that port. For Vite, pass `--strictPort` (e.g. `npm run dev -- --strictPort`) so the server fails instead of silently moving to another port.
+
 **Multiple servers (e.g., backend + frontend):**
 ```bash
 python scripts/with_server.py \
