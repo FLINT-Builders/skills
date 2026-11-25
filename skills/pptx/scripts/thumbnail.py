@@ -26,12 +26,13 @@ from pathlib import Path
 import defusedxml.minidom
 from defusedxml import ElementTree
 from office.helpers import SLIDE_REL_TYPE, opc_target
-from office.soffice import run_soffice
+from office.soffice import DEFAULT_MAX_PDF_PAGES, export_pdf
 from PIL import Image, ImageDraw, ImageFont
 
 
 THUMBNAIL_WIDTH = 300
-CONVERSION_DPI = 100
+MAX_SLIDES = DEFAULT_MAX_PDF_PAGES
+RENDER_LONG_EDGE = 1000
 MAX_COLS = 6
 DEFAULT_COLS = 3
 JPEG_QUALITY = 95
@@ -188,21 +189,16 @@ def create_hidden_placeholder(size: tuple[int, int]) -> Image.Image:
 def convert_to_images(pptx_path: Path, temp_dir: Path) -> list[Path]:
     pdf_path = temp_dir / f"{pptx_path.stem}.pdf"
 
-    result = run_soffice(
-        ["--headless", "--convert-to", "pdf", "--outdir", str(temp_dir), str(pptx_path)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or not pdf_path.exists():
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"PDF conversion failed: {detail}" if detail else "PDF conversion failed")
+    export_pdf(pptx_path, pdf_path, max_pages=MAX_SLIDES)
 
     result = subprocess.run(
         [
             "pdftoppm",
             "-jpeg",
-            "-r",
-            str(CONVERSION_DPI),
+            "-scale-to",
+            str(RENDER_LONG_EDGE),
+            "-l",
+            str(MAX_SLIDES),
             str(pdf_path),
             str(temp_dir / "slide"),
         ],

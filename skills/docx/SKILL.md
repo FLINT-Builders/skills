@@ -37,12 +37,13 @@ A `.docx` is a ZIP archive of XML files. Choose your approach by task:
 After writing a `.docx`, render it and look at it:
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.docx
-pdftoppm -jpeg -r 100 output.pdf page
-ls page-*.jpg   # then Read the images
+QA_DIR="$(mktemp -d)" &&
+python scripts/office/soffice.py --pdf output.docx "$QA_DIR/output.pdf" &&
+pdftoppm -jpeg -scale-to 1100 -l 40 "$QA_DIR/output.pdf" "$QA_DIR/page" &&
+ls "$QA_DIR"/page-*.jpg   # then Read the images
 ```
 
-`pdftoppm` zero-pads page numbers to the width of the page count (`page-01.jpg`…`page-12.jpg`).
+Images go to a fresh temporary directory, one per page, with the longer edge at 1100 px (100 DPI on US Letter) whatever the page size. `pdftoppm` zero-pads page numbers to the width of the page count (`page-01.jpg`…`page-12.jpg`). Documents over 40 pages are refused before any PDF is written; to check a longer one, render a copy cut down to the pages you need.
 
 ## Editing existing documents
 
