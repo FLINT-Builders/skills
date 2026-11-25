@@ -5,11 +5,10 @@ Requires LibreOffice (soffice) to be installed.
 
 import argparse
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 
-from office.soffice import get_soffice_env
+from office.soffice import get_soffice_env, harden_profile, sanitize_ooxml
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +47,17 @@ def accept_changes(
 
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(input_path, output_path)
+        sanitize_ooxml(input_path, output_path)
     except Exception as e:
         return None, f"Error: Failed to copy input file to output location: {e}"
 
     if not _setup_libreoffice_macro():
         return None, "Error: Failed to setup LibreOffice macro"
+
+    try:
+        harden_profile(Path(LIBREOFFICE_PROFILE))
+    except Exception as e:
+        return None, f"Error: Failed to harden LibreOffice profile: {e}"
 
     cmd = [
         "soffice",

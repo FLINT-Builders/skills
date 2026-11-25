@@ -16,11 +16,14 @@ import time
 import zipfile
 from pathlib import Path
 
-from office.soffice import get_soffice_env, run_soffice
+from office.soffice import get_soffice_env, harden_profile, run_soffice, sanitize_ooxml
 
 from openpyxl import load_workbook
 
 MACRO_FILENAME = "Module1.xba"
+# Links to other workbooks are the one external target recalculation keeps;
+# external_links_at_risk() decides whether they may be recalculated at all.
+EXTERNAL_WORKBOOK_RELS = ("externallinkpath",)
 SOFFICE_MISSING = "soffice not found on PATH; LibreOffice is required to recalculate"
 
 MAX_LOCATIONS = 100
@@ -161,15 +164,13 @@ def recalc(filename, timeout=30, force=False):
         return _recalc_with_profile(filename, abs_path, timeout, Path(profile_dir))
 
 
-def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
-    started = time.monotonic()
-    profile_url, err = setup_libreoffice_macro(profile_dir, timeout=timeout)
-    if err:
-        return {"error": err}
+def _recalc_copy(filename, abs_path, workbook: Path, profile_url, timeout):
+    try:
+        sanitize_ooxml(abs_path, workbook, keep_external=EXTERNAL_WORKBOOK_RELS)
+    except Exception as e:
+        return {"error": f"Could not prepare {filename} for LibreOffice: {e}"}
 
-    timeout = max(5, int(timeout - (time.monotonic() - started)))
-
-    before = _stamp(abs_path)
+    before = _stamp(workbook)
 
     cmd = [
         "soffice",
@@ -177,7 +178,7 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
         "--norestore",
         f"-env:UserInstallation={profile_url}",
         "vnd.sun.star.script:Standard.Module1.RecalculateAndSave?language=Basic&location=application",
-        abs_path,
+        str(workbook),
     ]
 
     if platform.system() == "Linux" and shutil.which("timeout"):
@@ -203,13 +204,50 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
         detail = (result.stderr or "").strip() or f"soffice exited {result.returncode}"
         return {"error": f"LibreOffice failed to recalculate: {detail}"}
 
-    if _stamp(abs_path) == before:
+    if _stamp(workbook) == before:
         return {
             "error": (
                 "LibreOffice exited cleanly but never rewrote the file, so nothing was "
                 "recalculated. Check that no other LibreOffice instance is running, then retry."
             )
         }
+
+    try:
+        shutil.copyfile(workbook, abs_path)
+    except OSError as e:
+        return {"error": f"Could not write the recalculated workbook back to {filename}: {e}"}
+    return None
+
+
+def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
+    started = time.monotonic()
+    profile_url, err = setup_libreoffice_macro(profile_dir, timeout=timeout)
+    if err:
+        return {"error": err}
+    try:
+        harden_profile(profile_dir)
+    except Exception as e:
+        return {"error": f"Could not harden the LibreOffice profile: {e}"}
+
+    timeout = max(5, int(timeout - (time.monotonic() - started)))
+
+    # LibreOffice opens a sanitized copy, never the workbook itself. The copy sits
+    # beside the workbook so links LibreOffice stores relative to it stay valid.
+    source = Path(abs_path)
+    try:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{source.stem}.recalc-", suffix=source.suffix, dir=source.parent
+        )
+        os.close(fd)
+    except OSError as e:
+        return {"error": f"Could not create a working copy next to {filename}: {e}"}
+    workbook = Path(name)
+    try:
+        err = _recalc_copy(filename, abs_path, workbook, profile_url, timeout)
+    finally:
+        workbook.unlink(missing_ok=True)
+    if err:
+        return err
 
     try:
         wb = load_workbook(filename, data_only=True)
