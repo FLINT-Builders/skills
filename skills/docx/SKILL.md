@@ -49,11 +49,10 @@ ls page-*.jpg   # then Read the images
 Legacy `.doc` files must be converted first: `python scripts/office/soffice.py --headless --convert-to docx file.doc`.
 
 ```bash
-unzip -q doc.docx -d unpacked/
-find unpacked -type l -delete   # strip symlink entries — docx from external parties is untrusted
+unzip -Z doc.docx | awk '/^l/{print "symlink entry: " $NF; bad=1} END{exit bad}' && unzip -q doc.docx -d unpacked/   # refuse symlink entries — docx from external parties is untrusted
 python scripts/merge_runs.py unpacked/   # coalesce fragmented runs so text is findable
 # edit unpacked/word/document.xml in place — do NOT reformat or pretty-print
-(cd unpacked && rm -f ../out.docx && zip -Xr ../out.docx .)
+(cd unpacked && python3 -I -S -c $'import os,stat,struct,sys,zlib\nL=[];C=[];N=0\ndef walk(d,pre):\n global N\n for e in sorted(os.listdir(d)):\n  p=pre+e\n  try:fd=os.open(e,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=d)\n  except OSError as x:sys.exit("refusing to pack "+p+": "+x.strerror)\n  st=os.fstat(fd)\n  if stat.S_ISDIR(st.st_mode):walk(fd,p+"/");os.close(fd);continue\n  if not stat.S_ISREG(st.st_mode) or st.st_nlink>1:sys.exit("refusing to pack "+p+": not a regular file with one link")\n  b=open(fd,"rb").read();n=p.encode();c=zlib.compressobj(6,8,-15);z=c.compress(b)+c.flush();k=zlib.crc32(b)\n  C.append(struct.pack("<IHHHHHHIIIHHHHHII",0x02014b50,20,20,2048,8,0,33,k,len(z),len(b),len(n),0,0,0,0,0,N)+n)\n  h=struct.pack("<IHHHHHIIIHH",0x04034b50,20,2048,8,0,33,k,len(z),len(b),len(n),0)+n\n  L.extend((h,z));N+=len(h)+len(z)\nt=os.open(".",os.O_RDONLY|os.O_DIRECTORY)\nif not os.path.samestat(os.fstat(t),os.lstat(os.environ.get("PWD","."))):sys.exit("refusing to pack: the directory was reached through a symlink")\nwalk(t,"")\nc=b"".join(C)\nL.append(c+struct.pack("<IHHHHIIH",0x06054b50,0,0,len(C),len(C),len(c),N,0))\nwith open(os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o666),"wb") as o:o.writelines(L)' ../out.docx)   # refuses symlinks, hardlinks and special files
 python scripts/office/validate.py out.docx --original doc.docx   # XSD checks; --auto-repair fixes common issues
 # redlining? add --author "<the name you redlined under>" to check every edit is tracked
 ```

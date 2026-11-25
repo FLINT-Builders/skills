@@ -11,7 +11,12 @@ Example:
 """
 
 import fnmatch
+import os
+import shutil
+import stat
 import sys
+import tempfile
+import time
 import zipfile
 from pathlib import Path
 from scripts.quick_validate import validate_skill
@@ -37,6 +42,44 @@ def should_exclude(rel_path: Path) -> bool:
     if name in EXCLUDE_FILES:
         return True
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_GLOBS)
+
+
+def add_tree(zipf, dir_fd, rel_dir):
+    """Add the regular files under dir_fd to zipf, refusing symlinks.
+
+    Each entry is opened relative to its parent's fd with O_NOFOLLOW and
+    checked with fstat on that fd, so a path swapped to a symlink after the
+    listing is refused rather than read through.
+    """
+    for name in sorted(os.listdir(dir_fd)):
+        arcname = rel_dir / name
+        if should_exclude(arcname):
+            print(f"  Skipped: {arcname}")
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        except OSError as e:
+            raise ValueError(f"refusing to package {arcname}: {e.strerror}") from None
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                add_tree(zipf, fd, arcname)
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise ValueError(
+                    f"refusing to package {arcname}: not a regular file with a single link"
+                )
+            info = zipfile.ZipInfo(
+                arcname.as_posix(), max(time.localtime(st.st_mtime)[:6], (1980, 1, 1, 0, 0, 0))
+            )
+            info.external_attr = (st.st_mode & 0xFFFF) << 16
+            info.file_size = st.st_size
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with os.fdopen(fd, 'rb', closefd=False) as src, zipf.open(info, 'w') as dst:
+                shutil.copyfileobj(src, dst)
+            print(f"  Added: {arcname}")
+        finally:
+            os.close(fd)
 
 
 def package_skill(skill_path, output_dir=None):
@@ -86,19 +129,20 @@ def package_skill(skill_path, output_dir=None):
 
     skill_filename = output_path / f"{skill_name}.skill"
 
-    # Create the .skill file (zip format)
+    # Create the .skill file (zip format). The archive is staged in an
+    # anonymous temp file so nothing is written to the output path unless
+    # every entry was read.
     try:
-        with zipfile.ZipFile(skill_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # Walk through the skill directory, excluding build artifacts
-            for file_path in skill_path.rglob('*'):
-                if not file_path.is_file():
-                    continue
-                arcname = file_path.relative_to(skill_path.parent)
-                if should_exclude(arcname):
-                    print(f"  Skipped: {arcname}")
-                    continue
-                zipf.write(file_path, arcname)
-                print(f"  Added: {arcname}")
+        with tempfile.TemporaryFile() as staged:
+            with zipfile.ZipFile(staged, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                top = os.open(skill_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    add_tree(zipf, top, Path(skill_name))
+                finally:
+                    os.close(top)
+            staged.seek(0)
+            with open(skill_filename, 'wb') as out:
+                shutil.copyfileobj(staged, out)
 
         print(f"\n✅ Successfully packaged skill to: {skill_filename}")
         return skill_filename

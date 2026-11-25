@@ -25,8 +25,9 @@ A duplicated slide still holds the source's content: edit ppt/slides/slideN.xml
 """
 
 import argparse
+import os
 import re
-import shutil
+import stat
 import sys
 from typing import NoReturn
 import tempfile
@@ -71,6 +72,23 @@ SLIDE_ID_MAX = 2147483647
 def _die(msg: str) -> NoReturn:
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _copy_part(src: Path, dst: Path) -> None:
+    # Copying through a symlink would turn the link's target into a regular
+    # part that packing accepts, so the source must be a regular file itself.
+    try:
+        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        _die(f"cannot copy {src}: {e.strerror}")
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            _die(f"cannot copy {src}: not a regular file with a single link")
+        data = fh.read()
+    out_fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666)
+    with os.fdopen(out_fd, "wb") as out:
+        out.write(data)
 
 
 def get_next_slide_number(slides_dir: Path) -> int:
@@ -124,13 +142,13 @@ def duplicate_slide(unpacked_dir: Path, source: str, after: str | None = None) -
     dest = f"slide{next_num}.xml"
     after_rid = _precheck_registration(unpacked_dir, after, dest)
 
-    shutil.copy2(source_slide, slides_dir / dest)
+    _copy_part(source_slide, slides_dir / dest)
 
     source_rels = rels_dir / f"{source}.rels"
     shared_parts: list[str] = []
     if source_rels.exists():
         dest_rels = rels_dir / f"{dest}.rels"
-        shutil.copy2(source_rels, dest_rels)
+        _copy_part(source_rels, dest_rels)
         rels_content = dest_rels.read_text(encoding="utf-8")
         rels_content = RELATIONSHIP_RE.sub(
             lambda m: "" if NOTES_SLIDE_TYPE_RE.search(m.group(0)) else m.group(0),

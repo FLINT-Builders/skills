@@ -1,8 +1,10 @@
 import os
 import posixpath
 import re
+import shutil
 import stat
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from pathlib import Path
@@ -82,30 +84,69 @@ def safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
         zf.extract(m, dest)
 
 
+_CONTENT_TYPES = "[Content_Types].xml"
+_OPEN_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+
+
+def _zip_tree(zf: zipfile.ZipFile, dir_fd: int, prefix: str) -> None:
+    # Every entry is opened relative to its parent's fd with O_NOFOLLOW and
+    # checked with fstat on that fd, so a path swapped to a symlink after the
+    # listing is refused rather than read through.
+    for name in sorted(os.listdir(dir_fd), key=lambda n: (n != _CONTENT_TYPES, n)):
+        arcname = prefix + name
+        try:
+            fd = os.open(name, _OPEN_NOFOLLOW, dir_fd=dir_fd)
+        except OSError as e:
+            raise ValueError(f"refusing to pack {arcname!r}: {e.strerror}") from None
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                _zip_tree(zf, fd, arcname + "/")
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise ValueError(
+                    f"refusing to pack {arcname!r}: not a regular file with a single link"
+                )
+            info = zipfile.ZipInfo(
+                arcname, max(time.localtime(st.st_mtime)[:6], (1980, 1, 1, 0, 0, 0))
+            )
+            info.external_attr = (st.st_mode & 0xFFFF) << 16
+            info.file_size = st.st_size
+            info.compress_type = (
+                zipfile.ZIP_STORED if arcname == _CONTENT_TYPES else zipfile.ZIP_DEFLATED
+            )
+            with os.fdopen(fd, "rb", closefd=False) as src, zf.open(info, "w") as dst:
+                shutil.copyfileobj(src, dst)
+        finally:
+            os.close(fd)
+
+
 def rezip(src_dir: Path, out_path: Path) -> None:
-    files = sorted(p for p in src_dir.rglob("*") if p.is_file())
-    ct = src_dir / "[Content_Types].xml"
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=out_path.name + ".", suffix=".tmp", dir=out_path.parent
-    )
-    tmp_out = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            with zipfile.ZipFile(fh, "w", zipfile.ZIP_DEFLATED) as zf:
-                if ct.exists():
-                    zf.write(ct, ct.relative_to(src_dir), compress_type=zipfile.ZIP_STORED)
-                for f in files:
-                    if f == ct:
-                        continue
-                    zf.write(f, f.relative_to(src_dir))
-        if out_path.exists():
-            mode = out_path.stat().st_mode & 0o777
-        else:
-            umask = os.umask(0)
-            os.umask(umask)
-            mode = 0o666 & ~umask
-        os.chmod(tmp_out, mode)
-        os.replace(tmp_out, out_path)
-    finally:
-        if tmp_out.exists():
-            tmp_out.unlink()
+    # The archive is built in an anonymous temp file so nothing appears next to
+    # out_path until every entry has been read.
+    with tempfile.TemporaryFile() as staged:
+        with zipfile.ZipFile(staged, "w", zipfile.ZIP_DEFLATED) as zf:
+            top = os.open(src_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                _zip_tree(zf, top, "")
+            finally:
+                os.close(top)
+        staged.seek(0)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=out_path.name + ".", suffix=".tmp", dir=out_path.parent
+        )
+        tmp_out = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                shutil.copyfileobj(staged, fh)
+            if out_path.exists():
+                mode = out_path.stat().st_mode & 0o777
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                mode = 0o666 & ~umask
+            os.chmod(tmp_out, mode)
+            os.replace(tmp_out, out_path)
+        finally:
+            if tmp_out.exists():
+                tmp_out.unlink()
