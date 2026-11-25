@@ -24,7 +24,6 @@ After running, add markers to word/document.xml so the comment is visible:
 
 import argparse
 import random
-import shutil
 import sys
 import tempfile
 import zipfile
@@ -35,7 +34,7 @@ import defusedxml.minidom
 from xml.parsers.expat import ExpatError
 from xml.sax.saxutils import escape as xml_escape
 
-from office.helpers import opc_target, rezip as _rezip, safe_extract as _safe_extract
+from office.helpers import PackageDir, opc_target, rezip as _rezip, safe_extract as _safe_extract
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 NS = {
@@ -97,8 +96,8 @@ def _encode_smart_quotes(text: str) -> str:
     return text
 
 
-def _append_xml(xml_path: Path, root_tag: str, content: str) -> None:
-    dom = defusedxml.minidom.parseString(xml_path.read_text(encoding="utf-8"))
+def _append_xml(pkg: PackageDir, xml_path: str, root_tag: str, content: str) -> None:
+    dom = defusedxml.minidom.parseString(pkg.read_text(xml_path))
     root = dom.getElementsByTagName(root_tag)[0]
     ns_attrs = " ".join(f'xmlns:{k}="{v}"' for k, v in NS.items())
     wrapper_dom = defusedxml.minidom.parseString(f"<root {ns_attrs}>{content}</root>")
@@ -106,11 +105,11 @@ def _append_xml(xml_path: Path, root_tag: str, content: str) -> None:
         if child.nodeType == child.ELEMENT_NODE:
             root.appendChild(dom.importNode(child, True))
     output = _encode_smart_quotes(dom.toxml(encoding="UTF-8").decode("utf-8"))
-    xml_path.write_text(output, encoding="utf-8")
+    pkg.write_text(xml_path, output)
 
 
-def _find_para_id(comments_path: Path, comment_id: int) -> str | None:
-    dom = defusedxml.minidom.parseString(comments_path.read_text(encoding="utf-8"))
+def _find_para_id(pkg: PackageDir, comments_path: str, comment_id: int) -> str | None:
+    dom = defusedxml.minidom.parseString(pkg.read_text(comments_path))
     for c in dom.getElementsByTagName("w:comment"):
         if c.getAttribute("w:id") == str(comment_id):
             for p in c.getElementsByTagName("w:p"):
@@ -119,10 +118,10 @@ def _find_para_id(comments_path: Path, comment_id: int) -> str | None:
     return None
 
 
-def _next_comment_id(comments_path: Path) -> int:
-    if not comments_path.exists():
+def _next_comment_id(pkg: PackageDir, comments_path: str) -> int:
+    if not pkg.is_file(comments_path):
         return 0
-    dom = defusedxml.minidom.parseString(comments_path.read_text(encoding="utf-8"))
+    dom = defusedxml.minidom.parseString(pkg.read_text(comments_path))
     ids = []
     for c in dom.getElementsByTagName("w:comment"):
         try:
@@ -132,8 +131,7 @@ def _next_comment_id(comments_path: Path) -> int:
     return (max(ids) + 1) if ids else 0
 
 
-def _get_next_rid(rels_path: Path) -> int:
-    dom = defusedxml.minidom.parseString(rels_path.read_text(encoding="utf-8"))
+def _get_next_rid(dom) -> int:
     max_rid = 0
     for rel in dom.getElementsByTagName("Relationship"):
         rid = rel.getAttribute("Id")
@@ -175,11 +173,16 @@ _COMMENT_OVERRIDES = [
 ]
 
 
-def _ensure_comment_relationships(unpacked_dir: Path) -> None:
-    rels_path = unpacked_dir / "word" / "_rels" / "document.xml.rels"
-    if not rels_path.exists():
+DOCUMENT_RELS = "word/_rels/document.xml.rels"
+CONTENT_TYPES = "[Content_Types].xml"
+COMMENT_PARTS = ("comments.xml", "commentsExtended.xml", "commentsIds.xml", "commentsExtensible.xml")
+
+
+def _ensure_comment_relationships(pkg: PackageDir) -> None:
+    rels_path = DOCUMENT_RELS
+    if not pkg.is_file(rels_path):
         return
-    dom = defusedxml.minidom.parseString(rels_path.read_text(encoding="utf-8"))
+    dom = defusedxml.minidom.parseString(pkg.read_text(rels_path))
     root = dom.documentElement
     comment_types = {rel_type for rel_type, _ in _COMMENT_RELS}
     existing = set()
@@ -193,7 +196,7 @@ def _ensure_comment_relationships(unpacked_dir: Path) -> None:
         )
         if part is not None:
             existing.add(part)
-    next_rid = _get_next_rid(rels_path)
+    next_rid = _get_next_rid(dom)
     changed = False
     for rel_type, target in _COMMENT_RELS:
         if opc_target(target, "word/document.xml") in existing:
@@ -206,14 +209,14 @@ def _ensure_comment_relationships(unpacked_dir: Path) -> None:
         next_rid += 1
         changed = True
     if changed:
-        rels_path.write_bytes(dom.toxml(encoding="UTF-8"))
+        pkg.write_bytes(rels_path, dom.toxml(encoding="UTF-8"))
 
 
-def _ensure_comment_content_types(unpacked_dir: Path) -> None:
-    ct_path = unpacked_dir / "[Content_Types].xml"
-    if not ct_path.exists():
+def _ensure_comment_content_types(pkg: PackageDir) -> None:
+    ct_path = CONTENT_TYPES
+    if not pkg.is_file(ct_path):
         return
-    dom = defusedxml.minidom.parseString(ct_path.read_text(encoding="utf-8"))
+    dom = defusedxml.minidom.parseString(pkg.read_text(ct_path))
     root = dom.documentElement
     existing = {
         o.getAttribute("PartName")
@@ -229,7 +232,7 @@ def _ensure_comment_content_types(unpacked_dir: Path) -> None:
         root.appendChild(override)  
         changed = True
     if changed:
-        ct_path.write_bytes(dom.toxml(encoding="UTF-8"))
+        pkg.write_bytes(ct_path, dom.toxml(encoding="UTF-8"))
 
 
 def add_comment(
@@ -246,28 +249,48 @@ def add_comment(
         text = xml_escape(text)
     author = xml_escape(author, {'"': "&quot;"})
     initials = xml_escape(initials, {'"': "&quot;"})
-    word = unpacked_dir / "word"
-    if not word.exists():
-        raise FileNotFoundError(f"{word} not found (not an unpacked .docx?)")
+    with PackageDir(unpacked_dir) as pkg:
+        if not pkg.has_dir("word"):
+            raise FileNotFoundError(f"{unpacked_dir / 'word'} not found (not an unpacked .docx?)")
+        # Refuse links and non-files at every path written below before writing any of them.
+        for rel in (*(f"word/{p}" for p in COMMENT_PARTS), DOCUMENT_RELS, CONTENT_TYPES):
+            pkg.is_file(rel)
+        return _add_comment(pkg, text, comment_id, author, initials, parent_id)
 
-    comments = word / "comments.xml"
+
+def _ensure_part(pkg: PackageDir, name: str) -> str:
+    rel = f"word/{name}"
+    if not pkg.is_file(rel):
+        pkg.write_bytes(rel, (TEMPLATE_DIR / name).read_bytes(), exclusive=True)
+    return rel
+
+
+def _add_comment(
+    pkg: PackageDir,
+    text: str,
+    comment_id: int | None,
+    author: str,
+    initials: str,
+    parent_id: int | None,
+) -> tuple[int, str, str]:
+    comments = "word/comments.xml"
     if comment_id is None:
-        comment_id = _next_comment_id(comments)
+        comment_id = _next_comment_id(pkg, comments)
 
     parent_para = None
     if parent_id is not None:
-        parent_para = _find_para_id(comments, parent_id) if comments.exists() else None
+        parent_para = _find_para_id(pkg, comments, parent_id) if pkg.is_file(comments) else None
         if not parent_para:
             raise ValueError(f"parent comment {parent_id} not found")
 
     para_id, durable_id = _generate_hex_id(), _generate_hex_id()
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    if not comments.exists():
-        shutil.copy(TEMPLATE_DIR / "comments.xml", comments)
-    _ensure_comment_relationships(unpacked_dir)
-    _ensure_comment_content_types(unpacked_dir)
+    _ensure_part(pkg, "comments.xml")
+    _ensure_comment_relationships(pkg)
+    _ensure_comment_content_types(pkg)
     _append_xml(
+        pkg,
         comments,
         "w:comments",
         COMMENT_XML.format(
@@ -276,33 +299,27 @@ def add_comment(
         ),
     )
 
-    ext = word / "commentsExtended.xml"
-    if not ext.exists():
-        shutil.copy(TEMPLATE_DIR / "commentsExtended.xml", ext)
+    ext = _ensure_part(pkg, "commentsExtended.xml")
     if parent_para is not None:
         _append_xml(
-            ext, "w15:commentsEx",
+            pkg, ext, "w15:commentsEx",
             f'<w15:commentEx w15:paraId="{para_id}" w15:paraIdParent="{parent_para}" w15:done="0"/>',
         )
     else:
         _append_xml(
-            ext, "w15:commentsEx",
+            pkg, ext, "w15:commentsEx",
             f'<w15:commentEx w15:paraId="{para_id}" w15:done="0"/>',
         )
 
-    ids = word / "commentsIds.xml"
-    if not ids.exists():
-        shutil.copy(TEMPLATE_DIR / "commentsIds.xml", ids)
+    ids = _ensure_part(pkg, "commentsIds.xml")
     _append_xml(
-        ids, "w16cid:commentsIds",
+        pkg, ids, "w16cid:commentsIds",
         f'<w16cid:commentId w16cid:paraId="{para_id}" w16cid:durableId="{durable_id}"/>',
     )
 
-    extensible = word / "commentsExtensible.xml"
-    if not extensible.exists():
-        shutil.copy(TEMPLATE_DIR / "commentsExtensible.xml", extensible)
+    extensible = _ensure_part(pkg, "commentsExtensible.xml")
     _append_xml(
-        extensible, "w16cex:commentsExtensible",
+        pkg, extensible, "w16cex:commentsExtensible",
         f'<w16cex:commentExtensible w16cex:durableId="{durable_id}" w16cex:dateUtc="{ts}"/>',
     )
 
@@ -354,7 +371,7 @@ def main() -> None:
         else:
             print(f"Error: {src} is neither a directory nor a .docx/.dotx file", file=sys.stderr)
             sys.exit(1)
-    except (FileNotFoundError, ValueError, zipfile.BadZipFile, ExpatError) as e:
+    except (OSError, ValueError, zipfile.BadZipFile, ExpatError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
