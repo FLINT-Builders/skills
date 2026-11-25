@@ -544,11 +544,13 @@ async function getUser(id: string): Promise<any> {
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@modelcontextprotocol/sdk": "^1.24.0",
     "axios": "^1.7.9",
+    "express": "^5.0.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^5.0.0",
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
@@ -592,8 +594,12 @@ async function getUser(id: string): Promise<any> {
  * project management, and data export capabilities.
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { localhostHostValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
+import express from "express";
 import { z } from "zod";
 import axios, { AxiosError } from "axios";
 
@@ -714,14 +720,56 @@ async function runStdio() {
   console.error("MCP server running via stdio");
 }
 
-// For streamable HTTP (remote):
+// For streamable HTTP:
+// - Binds to 127.0.0.1 unless HOST is set. Only set HOST to a non-loopback
+//   address when the server must be reachable from other machines.
+// - Every request must send `Authorization: Bearer <MCP_AUTH_TOKEN>`. Use a long
+//   random value (e.g. `openssl rand -hex 32`). If MCP_AUTH_TOKEN is unset, all
+//   requests are rejected.
+// - Requests with an Origin header are rejected unless the origin is listed in
+//   MCP_ALLOWED_ORIGINS (comma-separated).
 async function runHTTP() {
   if (!process.env.EXAMPLE_API_KEY) {
     console.error("ERROR: EXAMPLE_API_KEY environment variable is required");
     process.exit(1);
   }
 
+  const host = process.env.HOST || '127.0.0.1';
+  const authToken = process.env.MCP_AUTH_TOKEN;
+  const authTokenDigest = authToken ? createHash('sha256').update(authToken).digest() : undefined;
+  const allowedOrigins = (process.env.MCP_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(origin => origin.trim())
+    .filter(Boolean);
+  if (!authTokenDigest) {
+    console.error("ERROR: MCP_AUTH_TOKEN is not set; every request will be rejected");
+  }
+
   const app = express();
+
+  // DNS rebinding protection: on loopback, only accept localhost Host headers
+  if (['127.0.0.1', 'localhost', '::1'].includes(host)) {
+    app.use(localhostHostValidation());
+  }
+
+  // Authenticate before the body is parsed or any MCP handler runs
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin !== undefined && !allowedOrigins.includes(origin)) {
+      res.status(403).json({ error: "Origin not allowed" });
+      return;
+    }
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+    const authorized = authTokenDigest !== undefined && token !== '' &&
+      timingSafeEqual(createHash('sha256').update(token).digest(), authTokenDigest);
+    if (!authorized) {
+      res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: "Unauthorized" });
+      return;
+    }
+    next();
+  });
+
   app.use(express.json());
 
   app.post('/mcp', async (req, res) => {
@@ -735,8 +783,8 @@ async function runHTTP() {
   });
 
   const port = parseInt(process.env.PORT || '3000');
-  app.listen(port, () => {
-    console.error(`MCP server running on http://localhost:${port}/mcp`);
+  app.listen(port, host, () => {
+    console.error(`MCP server running on http://${host}:${port}/mcp`);
   });
 }
 
@@ -820,11 +868,44 @@ The TypeScript SDK supports two main transport mechanisms:
 
 #### Streamable HTTP (Recommended for Remote Servers)
 
+A remote server is reachable by anyone who can reach its port, so it must authenticate every request and reject untrusted `Origin` headers before any tool runs. Never deploy a streamable HTTP server without these checks. The sample below uses one shared bearer token from `MCP_AUTH_TOKEN`; for multi-user deployments, use OAuth 2.1 instead (the SDK's `requireBearerAuth` middleware validates access tokens). Serve it over HTTPS (for example behind a TLS-terminating proxy). For a server used only on the local machine, also bind to loopback as `runHTTP` does in the complete example.
+
 ```typescript
+import { createHash, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 
+// Without MCP_AUTH_TOKEN every request is rejected
+const authToken = process.env.MCP_AUTH_TOKEN;
+const authTokenDigest = authToken ? createHash('sha256').update(authToken).digest() : undefined;
+const allowedOrigins = (process.env.MCP_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+if (!authTokenDigest) {
+  console.error("ERROR: MCP_AUTH_TOKEN is not set; every request will be rejected");
+}
+
 const app = express();
+
+// Authenticate before the body is parsed or any MCP handler runs
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin !== undefined && !allowedOrigins.includes(origin)) {
+    res.status(403).json({ error: "Origin not allowed" });
+    return;
+  }
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length) : '';
+  const authorized = authTokenDigest !== undefined && token !== '' &&
+    timingSafeEqual(createHash('sha256').update(token).digest(), authTokenDigest);
+  if (!authorized) {
+    res.status(401).set('WWW-Authenticate', 'Bearer').json({ error: "Unauthorized" });
+    return;
+  }
+  next();
+});
+
 app.use(express.json());
 
 app.post('/mcp', async (req, res) => {
@@ -944,6 +1025,7 @@ Before finalizing your Node/TypeScript MCP server implementation, ensure:
 ### Advanced Features (where applicable)
 - [ ] Resources registered for appropriate data endpoints
 - [ ] Appropriate transport configured (stdio or streamable HTTP)
+- [ ] Streamable HTTP servers authenticate every request, reject disallowed `Origin` headers, and pass `127.0.0.1` to `listen()` when local
 - [ ] Notifications implemented for dynamic server capabilities
 - [ ] Type-safe with SDK interfaces
 

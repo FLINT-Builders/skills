@@ -153,6 +153,11 @@ Example pagination response:
 
 ### Authentication and Authorization
 
+**Streamable HTTP servers**:
+- Anyone who can reach the port can call every tool with the server's credentials, so authenticate every request before any tool runs
+- Never bind a server without authentication to a non-loopback address (`0.0.0.0`, `::`, or a public IP)
+- Fail closed: if no token or verifier is configured, reject requests rather than serving them
+
 **OAuth 2.1**:
 - Use secure OAuth 2.1 with certificates from recognized authorities
 - Validate access tokens before processing requests
@@ -181,9 +186,9 @@ Example pagination response:
 ### DNS Rebinding Protection
 
 For streamable HTTP servers running locally:
-- Enable DNS rebinding protection
-- Validate the `Origin` header on all incoming connections
-- Bind to `127.0.0.1` rather than `0.0.0.0`
+- Enable DNS rebinding protection (validate the `Host` header)
+- Validate the `Origin` header on all incoming connections and reject origins that are not explicitly allowed
+- Bind to `127.0.0.1` rather than `0.0.0.0` (in Node, pass the host to `listen()`; without one it binds all interfaces)
 
 ---
 
