@@ -26,7 +26,7 @@ from pathlib import Path
 import defusedxml.minidom
 from defusedxml import ElementTree
 from office.helpers import SLIDE_REL_TYPE, opc_target
-from office.soffice import run_soffice
+from office.soffice import run_soffice, sanitized_copy
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -73,11 +73,14 @@ def main():
     output_path = Path(f"{args.output_prefix}.jpg")
 
     try:
-        slide_info = get_slide_info(input_path)
-
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            visible_images = convert_to_images(input_path, temp_path)
+            source_dir = temp_path / "source"
+            source_dir.mkdir()
+            deck = sanitized_copy(input_path, source_dir, family="pptx")
+
+            slide_info = get_slide_info(deck)
+            visible_images = convert_to_images(deck, temp_path)
 
             if not visible_images and not any(s["hidden"] for s in slide_info):
                 print("Error: No slides found", file=sys.stderr)

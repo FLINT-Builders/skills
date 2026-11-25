@@ -44,6 +44,8 @@ ls page-*.jpg   # then Read the images
 
 `pdftoppm` zero-pads page numbers to the width of the page count (`page-01.jpg`…`page-12.jpg`).
 
+Always go through `soffice.py`, never bare `soffice`: it renders a copy with every link out of the package (linked pictures, remote templates) stripped, so a document cannot make LibreOffice fetch a URL or read a local file. It opens only OOXML and legacy `.doc`/`.ppt`/`.xls`.
+
 ## Editing existing documents
 
 Legacy `.doc` files must be converted first: `python scripts/office/soffice.py --headless --convert-to docx file.doc`.
