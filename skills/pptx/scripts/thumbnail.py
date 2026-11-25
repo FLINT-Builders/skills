@@ -16,7 +16,9 @@ Examples:
 """
 
 import argparse
+import os
 import posixpath
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -74,6 +76,7 @@ def main():
 
     try:
         slide_info = get_slide_info(input_path)
+        refuse_symlinks(grid_paths(len(slide_info), cols, output_path))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -222,26 +225,63 @@ def create_grids(
     output_path: Path,
 ) -> list[str]:
     max_per_grid = cols * (cols + 1)
+    paths = grid_paths(len(slides), cols, output_path)
+    refuse_symlinks(paths)
     grid_files = []
 
-    for chunk_idx, start_idx in enumerate(range(0, len(slides), max_per_grid)):
-        end_idx = min(start_idx + max_per_grid, len(slides))
-        chunk_slides = slides[start_idx:end_idx]
-
-        grid = create_grid(chunk_slides, cols, width)
-
-        if len(slides) <= max_per_grid:
-            grid_filename = output_path
-        else:
-            stem = output_path.stem
-            suffix = output_path.suffix
-            grid_filename = output_path.parent / f"{stem}-{chunk_idx + 1}{suffix}"
-
-        grid_filename.parent.mkdir(parents=True, exist_ok=True)
-        grid.save(str(grid_filename), quality=JPEG_QUALITY)
-        grid_files.append(str(grid_filename))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    dir_fd = os.open(output_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for start_idx, grid_filename in zip(
+            range(0, len(slides), max_per_grid), paths
+        ):
+            chunk_slides = slides[start_idx : start_idx + max_per_grid]
+            grid = create_grid(chunk_slides, cols, width)
+            publish_jpeg(grid, dir_fd, grid_filename.name)
+            grid_files.append(str(grid_filename))
+    finally:
+        os.close(dir_fd)
 
     return grid_files
+
+
+def grid_paths(slide_count: int, cols: int, output_path: Path) -> list[Path]:
+    max_per_grid = cols * (cols + 1)
+    if slide_count <= max_per_grid:
+        return [output_path]
+    grid_count = (slide_count + max_per_grid - 1) // max_per_grid
+    return [
+        output_path.parent / f"{output_path.stem}-{n}{output_path.suffix}"
+        for n in range(1, grid_count + 1)
+    ]
+
+
+def refuse_symlinks(paths: list[Path]) -> None:
+    for path in paths:
+        if path.is_symlink():
+            raise ValueError(f"Refusing to write through symbolic link: {path}")
+
+
+def publish_jpeg(image: Image.Image, dir_fd: int, name: str) -> None:
+    # The grid goes to a fresh file and is renamed over `name`; the rename
+    # replaces whatever entry is there, so a symlink is never followed.
+    tmp_name = f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(
+        tmp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o666,
+        dir_fd=dir_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            image.save(fh, "JPEG", quality=JPEG_QUALITY)
+        os.replace(tmp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_name, dir_fd=dir_fd)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def create_grid(
