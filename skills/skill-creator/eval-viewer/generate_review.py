@@ -446,7 +446,9 @@ def main() -> None:
         server = HTTPServer(("127.0.0.1", 0), handler)
         port = server.server_address[1]
 
-    url = f"http://localhost:{port}"
+    # The server only binds 127.0.0.1; "localhost" may resolve to ::1, which
+    # another local user could be listening on.
+    url = f"http://127.0.0.1:{port}"
     print(f"\n  Eval Viewer")
     print(f"  ─────────────────────────────────")
     print(f"  URL:       {url}")
