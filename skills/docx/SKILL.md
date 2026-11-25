@@ -53,7 +53,7 @@ unzip -q doc.docx -d unpacked/
 find unpacked -type l -delete   # strip symlink entries — docx from external parties is untrusted
 python scripts/merge_runs.py unpacked/   # coalesce fragmented runs so text is findable
 # edit unpacked/word/document.xml in place — do NOT reformat or pretty-print
-(cd unpacked && rm -f ../out.docx && zip -Xr ../out.docx .)
+(cd unpacked && rm -f ../out.docx && zip -Xry ../out.docx .)   # -y never packs a symlink's target
 python scripts/office/validate.py out.docx --original doc.docx   # XSD checks; --auto-repair fixes common issues
 # redlining? add --author "<the name you redlined under>" to check every edit is tracked
 ```

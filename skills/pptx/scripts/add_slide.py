@@ -25,8 +25,9 @@ A duplicated slide still holds the source's content: edit ppt/slides/slideN.xml
 """
 
 import argparse
+import os
 import re
-import shutil
+import stat
 import sys
 from typing import NoReturn
 import tempfile
@@ -73,10 +74,56 @@ def _die(msg: str) -> NoReturn:
     sys.exit(1)
 
 
-def get_next_slide_number(slides_dir: Path) -> int:
-    existing = [int(m.group(1)) for f in slides_dir.glob("slide*.xml")
-                if (m := re.match(r"slide(\d+)\.xml", f.name))]
+def get_next_slide_number(slides_dir: Path | int) -> int:
+    try:
+        names = os.listdir(slides_dir)
+    except FileNotFoundError:
+        names = []
+    existing = [int(m.group(1)) for name in names
+                if (m := re.fullmatch(r"slide(\d+)\.xml", name))]
     return max(existing) + 1 if existing else 1
+
+
+def _open_subdir(parent_fd: int, name: str, label: str, missing_ok: bool = False) -> int | None:
+    try:
+        return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        _die(f"{label} not found")
+    except OSError as e:
+        _die(f"refusing to use {label}: {e.strerror} (it must be a real directory, not a symlink)")
+
+
+def _read_part(dir_fd: int, name: str, label: str) -> bytes | None:
+    """Read a regular file that is a direct child of dir_fd; None if it doesn't exist.
+
+    The checks run on the opened descriptor, so a symlink, a non-regular
+    file, or a hard link to a file elsewhere can't be swapped in after them.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        _die(f"refusing to read {label}: {e.strerror} (symlinks are not followed)")
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        os.close(fd)
+        kind = "it is hard-linked to another path" if stat.S_ISREG(st.st_mode) else "not a regular file"
+        _die(f"refusing to read {label}: {kind}")
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read()
+
+
+def _write_part(dir_fd: int, name: str, data: bytes, exclusive: bool) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_EXCL if exclusive else os.O_TRUNC)
+    try:
+        fd = os.open(name, flags, 0o666, dir_fd=dir_fd)
+    except OSError as e:
+        _die(f"refusing to write {name}: {e.strerror} (an existing entry is in the way)")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
 
 
 def parse_source(source: str) -> tuple[str, str | None]:
@@ -113,34 +160,52 @@ def create_slide_from_layout(unpacked_dir: Path, layout_file: str, after: str | 
 
 
 def duplicate_slide(unpacked_dir: Path, source: str, after: str | None = None) -> str:
+    if source in ("", ".", "..") or "/" in source or os.sep in source or "\0" in source:
+        _die(f"source must be a file name in ppt/slides/ such as slide2.xml, not a path: {source!r}")
+
+    # Every part is opened relative to these descriptors with symlinks refused,
+    # so nothing outside the deck's own ppt/slides/ can be read into the new slide.
     slides_dir = unpacked_dir / "ppt" / "slides"
     rels_dir = slides_dir / "_rels"
-    source_slide = slides_dir / source
+    root_fd = os.open(unpacked_dir, os.O_RDONLY | os.O_DIRECTORY)
+    ppt_fd = slides_fd = rels_fd = None
+    try:
+        ppt_fd = _open_subdir(root_fd, "ppt", str(slides_dir.parent))
+        slides_fd = _open_subdir(ppt_fd, "slides", str(slides_dir))
+        rels_fd = _open_subdir(slides_fd, "_rels", str(rels_dir), missing_ok=True)
 
-    if not source_slide.exists():
-        _die(f"{source_slide} not found")
+        slide_data = _read_part(slides_fd, source, str(slides_dir / source))
+        if slide_data is None:
+            _die(f"{slides_dir / source} not found")
+        rels_data = None
+        if rels_fd is not None:
+            rels_data = _read_part(rels_fd, f"{source}.rels", str(rels_dir / f"{source}.rels"))
 
-    next_num = get_next_slide_number(slides_dir)
-    dest = f"slide{next_num}.xml"
-    after_rid = _precheck_registration(unpacked_dir, after, dest)
+        next_num = get_next_slide_number(slides_fd)
+        dest = f"slide{next_num}.xml"
+        after_rid = _precheck_registration(unpacked_dir, after, dest)
 
-    shutil.copy2(source_slide, slides_dir / dest)
+        _write_part(slides_fd, dest, slide_data, exclusive=True)
 
-    source_rels = rels_dir / f"{source}.rels"
-    shared_parts: list[str] = []
-    if source_rels.exists():
-        dest_rels = rels_dir / f"{dest}.rels"
-        shutil.copy2(source_rels, dest_rels)
-        rels_content = dest_rels.read_text(encoding="utf-8")
-        rels_content = RELATIONSHIP_RE.sub(
-            lambda m: "" if NOTES_SLIDE_TYPE_RE.search(m.group(0)) else m.group(0),
-            rels_content,
-        )
-        dest_rels.write_text(rels_content, encoding="utf-8")
-        shared_parts = sorted({
-            t for t in re.findall(r'Type="[^"]*/relationships/(\w+)"', rels_content)
-            if t in SHARED_PART_TYPES
-        })
+        shared_parts: list[str] = []
+        if rels_data is not None:
+            rels_content = RELATIONSHIP_RE.sub(
+                lambda m: "" if NOTES_SLIDE_TYPE_RE.search(m.group(0)) else m.group(0),
+                rels_data.decode("utf-8"),
+            )
+            try:
+                _write_part(rels_fd, f"{dest}.rels", rels_content.encode("utf-8"), exclusive=False)
+            except SystemExit:
+                os.unlink(dest, dir_fd=slides_fd)
+                raise
+            shared_parts = sorted({
+                t for t in re.findall(r'Type="[^"]*/relationships/(\w+)"', rels_content)
+                if t in SHARED_PART_TYPES
+            })
+    finally:
+        for fd in (rels_fd, slides_fd, ppt_fd, root_fd):
+            if fd is not None:
+                os.close(fd)
 
     _register_slide(unpacked_dir, dest, source, after_rid)
     if shared_parts:
