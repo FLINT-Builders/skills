@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from scripts.utils import parse_skill_md
+from scripts.utils import parse_skill_md, validate_skill_name
 
 
 def find_project_root() -> Path:
@@ -48,13 +48,19 @@ def run_single_query(
     stream events (content_block_start) rather than waiting for the
     full assistant message, which only arrives after tool execution.
     """
+    validate_skill_name(skill_name)
     unique_id = uuid.uuid4().hex[:8]
     clean_name = f"{skill_name}-skill-{unique_id}"
+    command_filename = f"{clean_name}.md"
     project_commands_dir = Path(project_root) / ".claude" / "commands"
-    command_file = project_commands_dir / f"{clean_name}.md"
 
+    project_commands_dir.mkdir(parents=True, exist_ok=True)
+    # Create and remove the file relative to one directory handle so both
+    # operations act on the same directory, and never follow a symlink at the
+    # file's own name.
+    commands_dir_fd = os.open(project_commands_dir, os.O_RDONLY | os.O_DIRECTORY)
+    created = False
     try:
-        project_commands_dir.mkdir(parents=True, exist_ok=True)
         # Use YAML block scalar to avoid breaking on quotes in description
         indented_desc = "\n  ".join(skill_description.split("\n"))
         command_content = (
@@ -65,7 +71,15 @@ def run_single_query(
             f"# {skill_name}\n\n"
             f"This skill handles: {skill_description}\n"
         )
-        command_file.write_text(command_content)
+        file_fd = os.open(
+            command_filename,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o644,
+            dir_fd=commands_dir_fd,
+        )
+        created = True
+        with os.fdopen(file_fd, "w", encoding="utf-8") as f:
+            f.write(command_content)
 
         cmd = [
             "claude",
@@ -177,8 +191,14 @@ def run_single_query(
 
         return triggered
     finally:
-        if command_file.exists():
-            command_file.unlink()
+        try:
+            if created:
+                try:
+                    os.unlink(command_filename, dir_fd=commands_dir_fd)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(commands_dir_fd)
 
 
 def run_eval(
@@ -193,6 +213,7 @@ def run_eval(
     model: str | None = None,
 ) -> dict:
     """Run the full eval set and return results."""
+    validate_skill_name(skill_name)
     results = []
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -277,6 +298,11 @@ def main():
         sys.exit(1)
 
     name, original_description, content = parse_skill_md(skill_path)
+    try:
+        validate_skill_name(name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     description = args.description or original_description
     project_root = find_project_root()
 
