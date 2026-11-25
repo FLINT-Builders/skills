@@ -16,7 +16,13 @@ import time
 import zipfile
 from pathlib import Path
 
-from office.soffice import get_soffice_env, run_soffice
+from office.soffice import (
+    UnsafeDocumentError,
+    get_soffice_env,
+    harden_profile,
+    run_soffice,
+    sanitized_copy,
+)
 
 from openpyxl import load_workbook
 
@@ -135,37 +141,55 @@ def recalc(filename, timeout=30, force=False):
     except Exception as e:  
         return {"error": f"Could not prepare the LibreOffice environment: {e}"}
 
-    if not force:
-        try:
-            at_risk = external_links_at_risk(filename)
-        except Exception as e:  
-            return {"error": f"Could not inspect {filename} for external links: {e}"}
-        if at_risk:
-            shown = at_risk[:MAX_LOCATIONS]
-            return {
-                "error": (
-                    "Refusing to recalculate: this workbook links to another workbook, and "
-                    f"{len(at_risk)} linked cell(s) have lost their cached value (openpyxl strips "
-                    "these on save). Recalculating would resolve them to #NAME? and delete the "
-                    "external links for good. Copy those cells' values from the original file "
-                    "before saving, or pass --force to accept the loss. Charts and conditional "
-                    "formats can hold external references too, so this list may not be exhaustive."
-                ),
-                "external_link_cells": shown,
-                "external_link_cells_truncated": max(0, len(at_risk) - len(shown)),
-            }
-
     with tempfile.TemporaryDirectory(
-        prefix="recalc-lo-profile-", ignore_cleanup_errors=True
-    ) as profile_dir:
-        return _recalc_with_profile(filename, abs_path, timeout, Path(profile_dir))
+        prefix="recalc-lo-", ignore_cleanup_errors=True
+    ) as work_dir:
+        work = Path(work_dir)
+        source_dir = work / "source"
+        source_dir.mkdir()
+        try:
+            workbook = sanitized_copy(abs_path, source_dir, family="xlsx")
+        except UnsafeDocumentError as e:
+            return {"error": f"Refusing to recalculate: {e}"}
+
+        if not force:
+            try:
+                at_risk = external_links_at_risk(workbook)
+            except Exception as e:  
+                return {"error": f"Could not inspect {filename} for external links: {e}"}
+            if at_risk:
+                shown = at_risk[:MAX_LOCATIONS]
+                return {
+                    "error": (
+                        "Refusing to recalculate: this workbook links to another workbook, and "
+                        f"{len(at_risk)} linked cell(s) have lost their cached value (openpyxl strips "
+                        "these on save). Recalculating would resolve them to #NAME? and delete the "
+                        "external links for good. Copy those cells' values from the original file "
+                        "before saving, or pass --force to accept the loss. Charts and conditional "
+                        "formats can hold external references too, so this list may not be exhaustive."
+                    ),
+                    "external_link_cells": shown,
+                    "external_link_cells_truncated": max(0, len(at_risk) - len(shown)),
+                }
+
+        profile_dir = work / "profile"
+        profile_dir.mkdir()
+        result = _recalc_with_profile(str(workbook), timeout, profile_dir)
+        if "error" in result:
+            return result
+        try:
+            shutil.copyfile(workbook, abs_path)
+        except OSError as e:
+            return {"error": f"Recalculated, but could not write {filename} back: {e}"}
+        return result
 
 
-def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
+def _recalc_with_profile(abs_path, timeout, profile_dir: Path):
     started = time.monotonic()
     profile_url, err = setup_libreoffice_macro(profile_dir, timeout=timeout)
     if err:
         return {"error": err}
+    harden_profile(profile_dir)
 
     timeout = max(5, int(timeout - (time.monotonic() - started)))
 
@@ -212,7 +236,7 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
         }
 
     try:
-        wb = load_workbook(filename, data_only=True)
+        wb = load_workbook(abs_path, data_only=True)
 
         excel_errors = [
             "#VALUE!",
@@ -255,7 +279,7 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
 
         wb.close()
 
-        wb_formulas = load_workbook(filename, data_only=False)
+        wb_formulas = load_workbook(abs_path, data_only=False)
         formula_count = 0
         for sheet_name in wb_formulas.sheetnames:
             ws = wb_formulas[sheet_name]
