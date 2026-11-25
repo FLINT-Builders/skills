@@ -9,7 +9,7 @@ license: Proprietary. LICENSE.txt has complete terms
 | Task | Approach |
 |---|---|
 | **Create** or **edit** with formulas/formatting | `openpyxl` — see gotchas below |
-| **Bulk data** in or out | `pandas` (`read_excel`, `to_excel`) |
+| **Bulk data** in or out | `pandas` `read_excel` in; out via `write_external_dataframe` (`scripts/external_cells.py`), never a bare `to_excel`, when the data came from outside |
 | **Quick look** at a sheet | `markitdown file.xlsx` — `## SheetName` per sheet; reads `.xlsm` too. No cell coordinates, so don't plan edits from it |
 | **Read** a model (formulas *and* values) | two `load_workbook` passes — see gotchas |
 
@@ -19,6 +19,7 @@ license: Proprietary. LICENSE.txt has complete terms
 
 ## Requirements for every output
 
+- **Outside text is never a formula.** pandas `to_excel`, openpyxl `cell.value = ...` and `ws.append` store any string starting with `=` as a live formula (xlsxwriter also `{=...}`), so one cell in an imported CSV, TSV, JSON, scraped table, form response or other user-provided text can run `=WEBSERVICE(...)` during recalc and ship inside the file. Write every value that did not come from you through `scripts/external_cells.py`: `write_external_dataframe(df, path)` instead of `df.to_excel`, `assign_external_value(cell, v)` instead of `cell.value = v`, `append_external_row(ws, row)` instead of `ws.append(row)`. Without the helper: in openpyxl set `cell.data_type = "s"` after assigning a string; in pandas use `engine="xlsxwriter"` with `engine_kwargs={"options": {"strings_to_formulas": False}}`. Never "fix" such text by stripping the `=` or by building a formula from it — only formulas you wrote yourself go in formula cells.
 - **Professional font** (Arial, Times New Roman) throughout, unless the user says otherwise.
 - **Zero formula errors.** Never ship while `recalc.py` reports `errors_found`. If you think an error predates you, prove it: load the *original* with `data_only=True` and look at that cell. An error you introduced looks exactly like one you inherited.
 - **Use formulas, never hardcoded results.** Write `sheet['B10'] = '=SUM(B2:B9)'`, not the Python-computed total. The sheet must recalculate when its inputs change.
@@ -44,6 +45,11 @@ withheld — trust `total_errors`, not the length of the list). Fix what it name
 again. **JSON with an `error` key instead of a `status` means nothing was recalculated**, and
 only that case exits non-zero — `errors_found` exits 0, so never treat a clean exit as a clean
 workbook.
+
+**`recalc.py` refuses, before LibreOffice runs, any workbook whose formulas call `WEBSERVICE` or
+`FILTERXML`** (with or without `_xlfn.`): evaluating them fetches a URL built from the sheet's
+own cells. There is no override. If the cells came from outside data, rewrite them as text with
+`scripts/external_cells.py`; never write these functions yourself.
 
 **A green recalc proves your formulas *evaluate*, not that they are *right*.** An off-by-one
 range or a reference to the wrong row yields a clean, error-free file with wrong numbers.
