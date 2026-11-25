@@ -29,6 +29,8 @@ bash scripts/init-artifact.sh <project-name>
 cd <project-name>
 ```
 
+`<project-name>` must be a single new directory name made of letters, digits, hyphens, and underscores (for example `my-artifact`). The script creates it under the current directory and refuses paths, `.`/`..`, and names that already exist.
+
 This creates a fully configured project with:
 - ✅ React + TypeScript (via Vite)
 - ✅ Tailwind CSS 3.4.1 with shadcn/ui theming system

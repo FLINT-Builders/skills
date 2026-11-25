@@ -3,6 +3,30 @@
 # Exit on error
 set -e
 
+# Check if project name is provided
+if [ -z "$1" ]; then
+  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
+  exit 1
+fi
+
+PROJECT_NAME="$1"
+
+# The project is created as one new directory directly under the current
+# directory, so the name must be a single path segment.
+if [[ ! "$PROJECT_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+  echo "❌ Error: Invalid project name: $PROJECT_NAME"
+  echo "   Use only letters, digits, hyphens, and underscores, starting with a letter or digit."
+  exit 1
+fi
+
+START_DIR="$(pwd -P)"
+PROJECT_DIR="$START_DIR/$PROJECT_NAME"
+
+if [ -e "$PROJECT_DIR" ] || [ -L "$PROJECT_DIR" ]; then
+  echo "❌ Error: $PROJECT_DIR already exists"
+  exit 1
+fi
+
 # Detect Node version
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
 
@@ -36,13 +60,6 @@ if ! command -v pnpm &> /dev/null; then
   npm install -g pnpm
 fi
 
-# Check if project name is provided
-if [ -z "$1" ]; then
-  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
-  exit 1
-fi
-
-PROJECT_NAME="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPONENTS_TARBALL="$SCRIPT_DIR/shadcn-components.tar.gz"
 
@@ -59,7 +76,15 @@ echo "🚀 Creating new React + Vite project: $PROJECT_NAME"
 pnpm create vite "$PROJECT_NAME" --template react-ts
 
 # Navigate into project directory
-cd "$PROJECT_NAME"
+if [ -L "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
+  echo "❌ Error: Vite did not create $PROJECT_DIR"
+  exit 1
+fi
+cd -P -- "$PROJECT_DIR"
+if [ "$(pwd -P)" != "$PROJECT_DIR" ]; then
+  echo "❌ Error: $PROJECT_DIR does not resolve to the new project directory"
+  exit 1
+fi
 
 echo "🧹 Cleaning up Vite template..."
 $SED_INPLACE '/<link rel="icon".*vite\.svg/d' index.html
