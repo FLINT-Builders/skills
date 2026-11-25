@@ -16,7 +16,7 @@ import webbrowser
 from pathlib import Path
 
 from scripts.generate_report import generate_html
-from scripts.improve_description import improve_description
+from scripts.improve_description import UnsafeDescriptionError, improve_description
 from scripts.run_eval import find_project_root, run_eval
 from scripts.utils import parse_skill_md
 
@@ -196,16 +196,22 @@ def run_loop(
             {k: v for k, v in h.items() if not k.startswith("test_")}
             for h in history
         ]
-        new_description = improve_description(
-            skill_name=name,
-            skill_content=content,
-            current_description=current_description,
-            eval_results=train_results,
-            history=blinded_history,
-            model=model,
-            log_dir=log_dir,
-            iteration=iteration,
-        )
+        try:
+            new_description = improve_description(
+                skill_name=name,
+                skill_content=content,
+                current_description=current_description,
+                eval_results=train_results,
+                history=blinded_history,
+                model=model,
+                log_dir=log_dir,
+                iteration=iteration,
+            )
+        except UnsafeDescriptionError as exc:
+            exit_reason = f"rejected_description (iteration {iteration}): {exc}"
+            if verbose:
+                print(f"\nRejected the proposed description: {exc}", file=sys.stderr)
+            break
         improve_elapsed = time.time() - t0
 
         if verbose:
