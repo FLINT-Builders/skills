@@ -13,9 +13,10 @@ the env dict carries the shim but names no user profile, and a non-root sandbox
 cannot bootstrap the default one -- soffice aborts with "User installation could
 not be completed" and converts nothing. get_soffice_env() stays public for the
 callers that build their own argv (they must pass -env:UserInstallation too).
+run_soffice always uses its own fresh profile; callers that need a specific
+profile must build their own argv.
 """
 
-import contextlib
 import os
 import socket
 import subprocess
@@ -36,14 +37,73 @@ def get_soffice_env() -> dict:
 
 
 def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
-    args = list(args)
-    with contextlib.ExitStack() as stack:
-        if not any(str(a).startswith("-env:UserInstallation") for a in args):
-            profile = stack.enter_context(
-                tempfile.TemporaryDirectory(prefix="lo_profile_", ignore_cleanup_errors=True)
-            )
-            args = [f"-env:UserInstallation={Path(profile).as_uri()}"] + args
+    """Run soffice with args in a fresh, empty user profile.
+
+    Caller-supplied bootstrap assignments (-env:NAME=VALUE or /env:NAME=VALUE,
+    including UserInstallation) are dropped: the profile is always a new
+    temporary directory. Raises ValueError for an unsupported option, which
+    includes a document path starting with "-" (pass it as ./-name instead).
+    """
+    args = _checked_args(args)
+    with tempfile.TemporaryDirectory(prefix="lo_profile_", ignore_cleanup_errors=True) as profile:
+        args = [f"-env:UserInstallation={Path(profile).as_uri()}"] + args
         return subprocess.run(["soffice"] + args, env=get_soffice_env(), **kwargs)
+
+
+_FLAG_OPTIONS = frozenset({
+    "headless",
+    "invisible",
+    "minimized",
+    "norestore",
+    "nologo",
+    "nodefault",
+    "nolockcheck",
+    "nofirststartwizard",
+    "terminate_after_init",
+    "cat",
+    "print-to-file",
+})
+_VALUE_OPTIONS = frozenset({"convert-to", "outdir", "convert-images-to", "printer-name"})
+_PREFIX_OPTIONS = ("infilter=",)
+_DOCUMENT_ACTIONS = frozenset({"convert-to", "print-to-file", "cat"})
+
+
+def _is_bootstrap_assignment(arg: str) -> bool:
+    # LibreOffice reads these from any argv position, and the first one for a
+    # name wins (sal/rtl/bootstrap.cxx getFromCommandLineArgs).
+    return arg[:1] in ("-", "/") and arg[1:5] == "env:" and "=" in arg
+
+
+def _checked_args(args: Iterable[str]) -> list[str]:
+    args = [str(a) for a in args]
+    args = [a for a in args if not _is_bootstrap_assignment(a)]
+
+    documents = 0
+    needs_document = False
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("-"):
+            name = arg[2:] if arg.startswith("--") else arg[1:]
+            if name in _VALUE_OPTIONS:
+                if i + 1 >= len(args):
+                    raise ValueError(f"soffice option {arg} needs a value")
+                needs_document |= name in _DOCUMENT_ACTIONS
+                i += 2
+                continue
+            if name not in _FLAG_OPTIONS and not name.startswith(_PREFIX_OPTIONS):
+                raise ValueError(
+                    f"unsupported soffice option {arg!r}; "
+                    "a document path starting with '-' must be passed as ./" + arg
+                )
+            needs_document |= name in _DOCUMENT_ACTIONS
+        elif arg:
+            documents += 1
+        i += 1
+
+    if needs_document and not documents:
+        raise ValueError("no document given to soffice")
+    return args
 
 
 
@@ -188,5 +248,9 @@ int close(int fd) {
 
 if __name__ == "__main__":
     import sys
-    result = run_soffice(sys.argv[1:])
+    try:
+        result = run_soffice(sys.argv[1:])
+    except ValueError as e:
+        print(f"soffice.py: {e}", file=sys.stderr)
+        sys.exit(2)
     sys.exit(result.returncode)

@@ -16,7 +16,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from office.soffice import get_soffice_env, run_soffice
+from office.soffice import get_soffice_env
 
 from openpyxl import load_workbook
 
@@ -56,10 +56,11 @@ def _stamp(path):
 def setup_libreoffice_macro(profile_dir: Path, timeout=30):
     url = profile_dir.as_uri()
     try:
-        run_soffice(
-            ["--headless", "--terminate_after_init", f"-env:UserInstallation={url}"],
+        subprocess.run(
+            ["soffice", f"-env:UserInstallation={url}", "--headless", "--terminate_after_init"],
             capture_output=True,
             timeout=timeout,
+            env=get_soffice_env(),
         )
     except FileNotFoundError:
         return None, SOFFICE_MISSING
