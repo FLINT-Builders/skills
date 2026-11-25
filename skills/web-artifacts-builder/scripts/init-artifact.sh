@@ -3,6 +3,27 @@
 # Exit on error
 set -e
 
+# Check if project name is provided
+if [ -z "$1" ]; then
+  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
+  exit 1
+fi
+
+PROJECT_NAME="$1"
+
+# The name becomes a directory, a package name and the page title, so only
+# allow a single plain folder name.
+is_safe_project_name() {
+  local LC_ALL=C
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+if ! is_safe_project_name "$PROJECT_NAME"; then
+  echo "❌ Error: invalid project name: $PROJECT_NAME"
+  echo "   Use only letters, digits, '.', '_' and '-', starting with a letter or digit."
+  exit 1
+fi
+
 # Detect Node version
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
 
@@ -36,13 +57,6 @@ if ! command -v pnpm &> /dev/null; then
   npm install -g pnpm
 fi
 
-# Check if project name is provided
-if [ -z "$1" ]; then
-  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
-  exit 1
-fi
-
-PROJECT_NAME="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPONENTS_TARBALL="$SCRIPT_DIR/shadcn-components.tar.gz"
 
@@ -63,7 +77,12 @@ cd "$PROJECT_NAME"
 
 echo "🧹 Cleaning up Vite template..."
 $SED_INPLACE '/<link rel="icon".*vite\.svg/d' index.html
-$SED_INPLACE 's/<title>.*<\/title>/<title>'"$PROJECT_NAME"'<\/title>/' index.html
+PROJECT_TITLE="$PROJECT_NAME" node -e "
+const fs = require('fs');
+const title = process.env.PROJECT_TITLE.replace(/[&<>\"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[c]);
+const html = fs.readFileSync('index.html', 'utf8');
+fs.writeFileSync('index.html', html.replace(/<title>.*<\\/title>/, () => '<title>' + title + '</title>'));
+"
 
 echo "📦 Installing base dependencies..."
 pnpm install
