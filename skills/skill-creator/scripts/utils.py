@@ -1,7 +1,28 @@
 """Shared utilities for skill-creator scripts."""
 
+import re
 from pathlib import Path
 
+MAX_SKILL_NAME_LENGTH = 64
+_SKILL_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def validate_skill_name(name: str) -> str:
+    """Return name if it is a kebab-case skill name, else raise ValueError.
+
+    The name is used to build a filename, so it must be a single path segment
+    made of lowercase letters, digits, and single hyphens.
+    """
+    if (
+        not isinstance(name, str)
+        or len(name) > MAX_SKILL_NAME_LENGTH
+        or not _SKILL_NAME_RE.fullmatch(name)
+    ):
+        raise ValueError(
+            f"Invalid skill name {name!r}: must be kebab-case (lowercase letters, "
+            f"digits, and single hyphens), at most {MAX_SKILL_NAME_LENGTH} characters"
+        )
+    return name
 
 
 def parse_skill_md(skill_path: Path) -> tuple[str, str, str]:

@@ -18,7 +18,7 @@ from pathlib import Path
 from scripts.generate_report import generate_html
 from scripts.improve_description import improve_description
 from scripts.run_eval import find_project_root, run_eval
-from scripts.utils import parse_skill_md
+from scripts.utils import parse_skill_md, validate_skill_name
 
 
 def split_eval_set(eval_set: list[dict], holdout: float, seed: int = 42) -> tuple[list[dict], list[dict]]:
@@ -62,6 +62,7 @@ def run_loop(
     """Run the eval + improvement loop."""
     project_root = find_project_root()
     name, original_description, content = parse_skill_md(skill_path)
+    validate_skill_name(name)
     current_description = description_override or original_description
 
     # Split into train/test if holdout > 0
@@ -266,6 +267,11 @@ def main():
         sys.exit(1)
 
     name, _, _ = parse_skill_md(skill_path)
+    try:
+        validate_skill_name(name)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     # Set up live report path
     if args.report != "none":
