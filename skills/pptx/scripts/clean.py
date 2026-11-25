@@ -16,29 +16,60 @@ This script removes:
 """
 
 import posixpath
-import re
 import sys
 from pathlib import Path
 
-import defusedxml.minidom
-
 from office.helpers import SLIDE_REL_TYPE, opc_target, rels_source_part
+from office.helpers.xml_part import XmlElement, XmlPart, XmlPartError
+
+P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+
+class RefusedToClean(Exception):
+    """The package does not look the way a readable package should."""
+
+
+def _elements(part: XmlPart, local_name: str) -> list[XmlElement]:
+    return [e for e in part.elements if e.local_name == local_name]
+
+
+def _slide_rels(
+    rels: XmlPart, pres_rels_path: Path, unpacked_dir: Path
+) -> list[tuple[XmlElement, str]]:
+    source_part = rels_source_part(pres_rels_path, unpacked_dir)
+    found = []
+    for rel in _elements(rels, "Relationship"):
+        if rel.attrib.get("Type", "") != SLIDE_REL_TYPE:
+            continue
+        part = opc_target(
+            rel.attrib.get("Target", ""), source_part, rel.attrib.get("TargetMode", "")
+        )
+        if part is not None:
+            found.append((rel, part))
+    return found
 
 
 def _slide_rids(pres_rels_path: Path, unpacked_dir: Path) -> dict[str, str]:
-    source_part = rels_source_part(pres_rels_path, unpacked_dir)
-    rels_dom = defusedxml.minidom.parse(str(pres_rels_path))
+    rels = XmlPart.read(pres_rels_path)
+    return {
+        rel.attrib.get("Id", ""): part
+        for rel, part in _slide_rels(rels, pres_rels_path, unpacked_dir)
+    }
 
-    rids: dict[str, str] = {}
-    for rel in rels_dom.getElementsByTagName("Relationship"):
-        if rel.getAttribute("Type") != SLIDE_REL_TYPE:
-            continue
-        part = opc_target(
-            rel.getAttribute("Target"), source_part, rel.getAttribute("TargetMode")
-        )
-        if part is not None:
-            rids[rel.getAttribute("Id")] = part
-    return rids
+
+def _listed_slide_rids(pres_path: Path) -> list[str]:
+    try:
+        pres = XmlPart.read(pres_path)
+    except XmlPartError as e:
+        raise RefusedToClean(str(e)) from e
+
+    return [
+        rid
+        for lst in pres.children(pres.root, f"{P_NS}sldIdLst")
+        for entry in pres.children(lst, f"{P_NS}sldId")
+        if (rid := entry.attrib.get(R_ID))
+    ]
 
 
 def get_slides_in_sldidlst(unpacked_dir: Path) -> set[str]:
@@ -49,19 +80,13 @@ def get_slides_in_sldidlst(unpacked_dir: Path) -> set[str]:
         return set()
 
     rid_to_slide = _slide_rids(pres_rels_path, unpacked_dir)
-
-    pres_content = pres_path.read_text(encoding="utf-8")
-    referenced_rids = set(re.findall(r'<p:sldId[^>]*r:id="([^"]+)"', pres_content))
+    referenced_rids = set(_listed_slide_rids(pres_path))
 
     return {
         posixpath.basename(rid_to_slide[rid])
         for rid in referenced_rids
         if rid in rid_to_slide
     }
-
-
-class RefusedToClean(Exception):
-    """The package does not look the way a readable package should."""
 
 
 def remove_orphaned_slides(unpacked_dir: Path) -> list[str]:
@@ -76,12 +101,8 @@ def remove_orphaned_slides(unpacked_dir: Path) -> list[str]:
     on_disk = sorted(slides_dir.glob("slide*.xml"))
 
     if on_disk and not any(s.name in referenced_slides for s in on_disk):
-        listed = re.findall(
-            r'<p:sldId[^>]*r:id="([^"]+)"',
-            (unpacked_dir / "ppt" / "presentation.xml").read_text(encoding="utf-8")
-            if (unpacked_dir / "ppt" / "presentation.xml").exists()
-            else "",
-        )
+        pres_path = unpacked_dir / "ppt" / "presentation.xml"
+        listed = _listed_slide_rids(pres_path) if pres_path.exists() else []
         if listed:
             raise RefusedToClean(
                 f"<p:sldIdLst> lists {len(listed)} slide(s) and none of the "
@@ -103,26 +124,14 @@ def remove_orphaned_slides(unpacked_dir: Path) -> list[str]:
                 removed.append(str(rels_file.relative_to(unpacked_dir)))
 
     if removed and pres_rels_path.exists():
-        rels_dom = defusedxml.minidom.parse(str(pres_rels_path))
-        source_part = rels_source_part(pres_rels_path, unpacked_dir)
-        changed = False
-
-        for rel in list(rels_dom.getElementsByTagName("Relationship")):
-            if rel.getAttribute("Type") != SLIDE_REL_TYPE:
-                continue
-            part = opc_target(
-                rel.getAttribute("Target"), source_part, rel.getAttribute("TargetMode")
-            )
-            if part is None:
-                continue
-            if posixpath.basename(part) not in referenced_slides:
-                if rel.parentNode:
-                    rel.parentNode.removeChild(rel)
-                    changed = True
-
-        if changed:
-            with open(pres_rels_path, "wb") as f:
-                f.write(rels_dom.toxml(encoding="utf-8"))
+        rels = XmlPart.read(pres_rels_path)
+        stale = [
+            rel
+            for rel, part in _slide_rels(rels, pres_rels_path, unpacked_dir)
+            if posixpath.basename(part) not in referenced_slides
+        ]
+        if stale:
+            pres_rels_path.write_bytes(rels.without(stale))
 
     return removed
 
@@ -147,10 +156,9 @@ def _referenced_by(rels_files, unpacked_dir: Path) -> set:
 
     for rels_file in rels_files:
         source_part = rels_source_part(rels_file, unpacked_dir)
-        dom = defusedxml.minidom.parse(str(rels_file))
-        for rel in dom.getElementsByTagName("Relationship"):
+        for rel in _elements(XmlPart.read(rels_file), "Relationship"):
             part = opc_target(
-                rel.getAttribute("Target"), source_part, rel.getAttribute("TargetMode")
+                rel.attrib.get("Target", ""), source_part, rel.attrib.get("TargetMode", "")
             )
             if part is not None:
                 referenced.add(Path(part))
@@ -230,28 +238,23 @@ def remove_orphaned_files(unpacked_dir: Path, referenced: set) -> list[str]:
     return removed
 
 
-def update_content_types(unpacked_dir: Path, removed_files: list[str]) -> None:
-    ct_path = unpacked_dir / "[Content_Types].xml"
-    if not ct_path.exists():
-        return
-
-    dom = defusedxml.minidom.parse(str(ct_path))
-    changed = False
-
-    for override in list(dom.getElementsByTagName("Override")):
-        part_name = override.getAttribute("PartName").lstrip("/")
-        if part_name in removed_files:
-            if override.parentNode:
-                override.parentNode.removeChild(override)
-                changed = True
-
-    if changed:
-        with open(ct_path, "wb") as f:
-            f.write(dom.toxml(encoding="utf-8"))
+def update_content_types(
+    ct_path: Path, content_types: XmlPart, removed_files: list[str]
+) -> None:
+    stale = [
+        override
+        for override in _elements(content_types, "Override")
+        if override.attrib.get("PartName", "").lstrip("/") in removed_files
+    ]
+    if stale:
+        ct_path.write_bytes(content_types.without(stale))
 
 
 def clean_unused_files(unpacked_dir: Path) -> list[str]:
     all_removed = []
+
+    ct_path = unpacked_dir / "[Content_Types].xml"
+    content_types = XmlPart.read(ct_path) if ct_path.exists() else None
 
     if list(unpacked_dir.rglob("*.rels")) and not get_referenced_files(unpacked_dir):
         raise RefusedToClean(
@@ -276,8 +279,8 @@ def clean_unused_files(unpacked_dir: Path) -> list[str]:
 
         all_removed.extend(total_removed)
 
-    if all_removed:
-        update_content_types(unpacked_dir, all_removed)
+    if all_removed and content_types is not None:
+        update_content_types(ct_path, content_types, all_removed)
 
     return all_removed
 

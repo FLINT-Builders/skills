@@ -10,10 +10,13 @@ from __future__ import annotations
 import posixpath
 import re
 from typing import Mapping
+from xml.etree.ElementTree import Element, ParseError
 
-from . import part_text
+import defusedxml.ElementTree
+from defusedxml import DefusedXmlException
 
 THEME_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
+_P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
 
 _MASTER_RE = re.compile(
     r"^ppt/(?P<group>slideMasters|notesMasters|handoutMasters)/"
@@ -21,9 +24,12 @@ _MASTER_RE = re.compile(
 )
 _GROUP_ORDER = {"slideMasters": 0, "notesMasters": 1, "handoutMasters": 2}
 
-_RELATIONSHIP_RE = re.compile(
-    r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL
-)
+
+def _parse(data: bytes) -> Element | None:
+    try:
+        return defusedxml.ElementTree.fromstring(data)
+    except (ParseError, DefusedXmlException):
+        return None
 
 
 def _sort_key(name: str) -> tuple[int, int]:
@@ -49,13 +55,18 @@ def _theme_rel(files: Mapping[str, bytes], master: str):
     rels = files.get(rels_path)
     if rels is None:
         return None
-    for element in _RELATIONSHIP_RE.findall(part_text(rels)):
-        if f'Type="{THEME_REL_TYPE}"' not in element:
+    root = _parse(rels)
+    if root is None:
+        return None
+    for element in root.iter():
+        if element.tag.rpartition("}")[2] != "Relationship":
             continue
-        target = re.search(r'\bTarget="([^"]+)"', element)
-        if target is None:
+        if element.get("Type") != THEME_REL_TYPE:
             continue
-        return rels_path, element, _resolve(rels_path, target.group(1))
+        target = element.get("Target")
+        if not target:
+            continue
+        return rels_path, element, _resolve(rels_path, target)
     return None
 
 
@@ -65,18 +76,20 @@ def _masters(files: Mapping[str, bytes]) -> list[str]:
 
 _PRESENTATION = "ppt/presentation.xml"
 _NOTES_MASTERS = "ppt/notesMasters/"
-_IGNORABLE_RE = re.compile(r"<!--.*?-->|<\?.*?\?>", re.DOTALL)
-_AFTER_SLDIDLST_RE = re.compile(
-    r"<p:sldIdLst\b(?:[^>]*/>|[^>]*>.*?</p:sldIdLst\s*>)\s*(<[^>\s/]+)", re.DOTALL
-)
 
 
 def _notes_master_share_is_inert(files: Mapping[str, bytes]) -> bool:
     data = files.get(_PRESENTATION)
     if data is None:
         return False
-    match = _AFTER_SLDIDLST_RE.search(_IGNORABLE_RE.sub("", part_text(data)))
-    return match is not None and match.group(1) == "<p:notesMasterIdLst"
+    root = _parse(data)
+    if root is None:
+        return False
+    children = list(root)
+    for i, child in enumerate(children[:-1]):
+        if child.tag == f"{_P_NS}sldIdLst":
+            return children[i + 1].tag == f"{_P_NS}notesMasterIdLst"
+    return False
 
 
 def _shares(files: Mapping[str, bytes]):
