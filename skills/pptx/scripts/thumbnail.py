@@ -23,12 +23,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-import defusedxml.minidom
 from defusedxml import ElementTree
 from office.helpers import SLIDE_REL_TYPE, opc_target
 from office.soffice import run_soffice
 from PIL import Image, ImageDraw, ImageFont
 
+SLD_ID = "{http://schemas.openxmlformats.org/presentationml/2006/main}sldId"
+R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 THUMBNAIL_WIDTH = 300
 CONVERSION_DPI = 100
@@ -108,29 +109,29 @@ def _is_hidden(zf: zipfile.ZipFile, part: str) -> bool:
 
 def get_slide_info(pptx_path: Path) -> list[dict]:
     with zipfile.ZipFile(pptx_path, "r") as zf:
-        rels_content = zf.read("ppt/_rels/presentation.xml.rels").decode("utf-8")
-        rels_dom = defusedxml.minidom.parseString(rels_content)
+        rels_root = ElementTree.fromstring(zf.read("ppt/_rels/presentation.xml.rels"))
 
         rid_to_part = {}
-        for rel in rels_dom.getElementsByTagName("Relationship"):
-            if rel.getAttribute("Type") != SLIDE_REL_TYPE:
+        for rel in rels_root.iter():
+            if rel.tag.rpartition("}")[2] != "Relationship":
+                continue
+            if rel.get("Type", "") != SLIDE_REL_TYPE:
                 continue
             part = opc_target(
-                rel.getAttribute("Target"),
+                rel.get("Target", ""),
                 "ppt/presentation.xml",
-                rel.getAttribute("TargetMode"),
+                rel.get("TargetMode", ""),
             )
             if part is not None:
-                rid_to_part[rel.getAttribute("Id")] = part
+                rid_to_part[rel.get("Id", "")] = part
 
-        pres_content = zf.read("ppt/presentation.xml").decode("utf-8")
-        pres_dom = defusedxml.minidom.parseString(pres_content)
+        pres_root = ElementTree.fromstring(zf.read("ppt/presentation.xml"))
 
         present = set(zf.namelist())
 
         slides = []
-        for sld_id in pres_dom.getElementsByTagName("p:sldId"):
-            part = rid_to_part.get(sld_id.getAttribute("r:id"))
+        for sld_id in pres_root.iter(SLD_ID):
+            part = rid_to_part.get(sld_id.get(R_ID, ""))
             if part is not None and part in present:
                 slides.append(
                     {"name": posixpath.basename(part), "hidden": _is_hidden(zf, part)}

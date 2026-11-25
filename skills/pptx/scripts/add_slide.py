@@ -34,6 +34,7 @@ import zipfile
 from pathlib import Path
 
 from office.helpers import rezip, safe_extract
+from office.helpers.xml_part import XmlElement, XmlPart, XmlPartError
 
 MINIMAL_SLIDE_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
@@ -61,8 +62,13 @@ MINIMAL_SLIDE_XML = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 
 SHARED_PART_TYPES = ("chart", "diagramData", "oleObject", "package")
 
-NOTES_SLIDE_TYPE_RE = re.compile(r"""Type=["'][^"']*/relationships/notesSlide["']""")
-RELATIONSHIP_RE = re.compile(r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL)
+REL_TYPE_PREFIX = "/relationships/"
+
+P_NS = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
+SLD_ID = f"{P_NS}sldId"
+SLD_ID_LST = f"{P_NS}sldIdLst"
+SLD_MASTER_ID_LST = f"{P_NS}sldMasterIdLst"
+R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
 
 SLIDE_ID_MIN = 256
 SLIDE_ID_MAX = 2147483647
@@ -71,6 +77,31 @@ SLIDE_ID_MAX = 2147483647
 def _die(msg: str) -> NoReturn:
     print(f"Error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def _read_part(raw: bytes, where: Path) -> XmlPart:
+    try:
+        return XmlPart(raw, where)
+    except XmlPartError as e:
+        _die(str(e))
+
+
+def _prefix(qname: bytes) -> bytes:
+    return qname[: qname.rfind(b":") + 1]
+
+
+def _sld_id_lst(pres: XmlPart) -> XmlElement | None:
+    found = pres.children(pres.root, SLD_ID_LST)
+    return found[0] if found else None
+
+
+def _sld_id_entries(pres: XmlPart) -> list[XmlElement]:
+    lst = _sld_id_lst(pres)
+    return pres.children(lst, SLD_ID) if lst is not None else []
+
+
+def _sld_id_for_rid(pres: XmlPart, rid: str) -> XmlElement | None:
+    return next((e for e in _sld_id_entries(pres) if e.attrib.get(R_ID) == rid), None)
 
 
 def get_next_slide_number(slides_dir: Path) -> int:
@@ -124,23 +155,27 @@ def duplicate_slide(unpacked_dir: Path, source: str, after: str | None = None) -
     dest = f"slide{next_num}.xml"
     after_rid = _precheck_registration(unpacked_dir, after, dest)
 
+    source_rels = rels_dir / f"{source}.rels"
+    rels = _read_part(source_rels.read_bytes(), source_rels) if source_rels.exists() else None
+
     shutil.copy2(source_slide, slides_dir / dest)
 
-    source_rels = rels_dir / f"{source}.rels"
     shared_parts: list[str] = []
-    if source_rels.exists():
-        dest_rels = rels_dir / f"{dest}.rels"
-        shutil.copy2(source_rels, dest_rels)
-        rels_content = dest_rels.read_text(encoding="utf-8")
-        rels_content = RELATIONSHIP_RE.sub(
-            lambda m: "" if NOTES_SLIDE_TYPE_RE.search(m.group(0)) else m.group(0),
-            rels_content,
-        )
-        dest_rels.write_text(rels_content, encoding="utf-8")
-        shared_parts = sorted({
-            t for t in re.findall(r'Type="[^"]*/relationships/(\w+)"', rels_content)
-            if t in SHARED_PART_TYPES
-        })
+    if rels is not None:
+        kept_types = []
+        notes = []
+        for rel in rels.elements:
+            if rel.local_name != "Relationship":
+                continue
+            _, sep, rel_type = rel.attrib.get("Type", "").rpartition(REL_TYPE_PREFIX)
+            if not sep:
+                continue
+            if rel_type == "notesSlide":
+                notes.append(rel)
+            else:
+                kept_types.append(rel_type)
+        (rels_dir / f"{dest}.rels").write_bytes(rels.without(notes))
+        shared_parts = sorted({t for t in kept_types if t in SHARED_PART_TYPES})
 
     _register_slide(unpacked_dir, dest, source, after_rid)
     if shared_parts:
@@ -155,13 +190,9 @@ def _precheck_registration(unpacked_dir: Path, after: str | None, dest: str) -> 
     pres_path = unpacked_dir / "ppt" / "presentation.xml"
     if not pres_path.exists():
         _die(f"{pres_path} not found — is this an unpacked PPTX?")
-    xml = pres_path.read_text(encoding="utf-8")
+    pres = _read_part(pres_path.read_bytes(), pres_path)
 
-    has_slot = (
-        "</p:sldIdLst>" in xml
-        or re.search(r"<p:sldIdLst\s*/>", xml)
-        or "</p:sldMasterIdLst>" in xml
-    )
+    has_slot = _sld_id_lst(pres) is not None or pres.children(pres.root, SLD_MASTER_ID_LST)
     if not has_slot:
         _die("presentation.xml has no <p:sldIdLst> (or <p:sldMasterIdLst> to anchor a new one)")
 
@@ -183,7 +214,7 @@ def _precheck_registration(unpacked_dir: Path, after: str | None, dest: str) -> 
     if not after:
         return None
     after_rid = _rid_for_slide(unpacked_dir, after)
-    if not re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml):
+    if _sld_id_for_rid(pres, after_rid) is None:
         _die(f"{after} ({after_rid}) is not listed in <p:sldIdLst>")
     return after_rid
 
@@ -243,8 +274,13 @@ def _find_slide_relationship(pres_rels: str, slide_name: str) -> str | None:
 
 
 def _get_next_slide_id(unpacked_dir: Path) -> int:
-    pres_content = (unpacked_dir / "ppt" / "presentation.xml").read_text(encoding="utf-8")
-    used = {int(m) for m in re.findall(r'<p:sldId[^>]*\bid="(\d+)"', pres_content)}
+    pres_path = unpacked_dir / "ppt" / "presentation.xml"
+    pres = _read_part(pres_path.read_bytes(), pres_path)
+    used = {
+        int(value)
+        for e in pres.elements
+        if e.tag == SLD_ID and (value := e.attrib.get("id", "")).isascii() and value.isdigit()
+    }
 
     candidate = max((i for i in used if i >= SLIDE_ID_MIN), default=SLIDE_ID_MIN - 1) + 1
     if candidate <= SLIDE_ID_MAX and candidate not in used:
@@ -259,41 +295,51 @@ def _insert_into_sld_id_lst(
     unpacked_dir: Path, slide_id: int, rid: str, after_rid: str | None = None
 ) -> tuple[int, int]:
     pres_path = unpacked_dir / "ppt" / "presentation.xml"
-    xml = pres_path.read_text(encoding="utf-8")
-    entry = f'<p:sldId id="{slide_id}" r:id="{rid}"/>'
+    pres = _read_part(pres_path.read_bytes(), pres_path)
+    data = pres.raw
 
-    if f'r:id="{rid}"' in xml:
+    if any(e.attrib.get(R_ID) == rid for e in pres.elements):
         _die(f"presentation.xml already references {rid}; refusing to add a duplicate")
 
-    if after_rid:
-        open_tag = re.search(rf'<p:sldId\b[^>]*r:id="{re.escape(after_rid)}"[^>]*>', xml)
-        if not open_tag:
-            _die(f"{after_rid} is not listed in <p:sldIdLst>")
-        end = open_tag.end()
-        if not open_tag.group(0).endswith("/>"):
-            close = xml.find("</p:sldId>", end)
-            if close == -1:
-                _die(f"unclosed <p:sldId> for {after_rid} in presentation.xml")
-            end = close + len("</p:sldId>")
-        xml = xml[:end] + entry + xml[end:]
-    elif "</p:sldIdLst>" in xml:
-        xml = xml.replace("</p:sldIdLst>", f"{entry}</p:sldIdLst>", 1)
-    elif re.search(r"<p:sldIdLst\s*/>", xml):
-        xml = re.sub(r"<p:sldIdLst\s*/>", f"<p:sldIdLst>{entry}</p:sldIdLst>", xml, count=1)
-    elif "</p:sldMasterIdLst>" in xml:
-        xml = xml.replace(
-            "</p:sldMasterIdLst>", f"</p:sldMasterIdLst><p:sldIdLst>{entry}</p:sldIdLst>", 1
-        )
+    lst = _sld_id_lst(pres)
+    if lst is None:
+        masters = pres.children(pres.root, SLD_MASTER_ID_LST)
+        if not masters:
+            _die("presentation.xml has no <p:sldIdLst> (or <p:sldMasterIdLst> to anchor a new one)")
+        prefix = _prefix(pres.qname(masters[0]))
     else:
-        _die("presentation.xml has no <p:sldIdLst> (or <p:sldMasterIdLst> to anchor a new one)")
+        prefix = _prefix(pres.qname(lst))
+    entry = b'<%ssldId id="%d" r:id="%s"/>' % (prefix, slide_id, rid.encode())
 
-    pres_path.write_text(xml, encoding="utf-8")
+    if after_rid:
+        anchor = _sld_id_for_rid(pres, after_rid)
+        if anchor is None:
+            _die(f"{after_rid} is not listed in <p:sldIdLst>")
+        at = pres.element_end(anchor)
+        updated = data[:at] + entry + data[at:]
+    elif lst is None:
+        at = pres.element_end(masters[0])
+        new_lst = b"<%ssldIdLst>%s</%ssldIdLst>" % (prefix, entry, prefix)
+        updated = data[:at] + new_lst + data[at:]
+    elif pres.is_empty_tag(lst):
+        at = pres.tag_end(lst.start)
+        updated = data[: at - 2] + b">" + entry + b"</" + pres.qname(lst) + b">" + data[at:]
+    else:
+        updated = data[: lst.end_event] + entry + data[lst.end_event :]
 
-    lst = re.search(r"<p:sldIdLst>(.*)</p:sldIdLst>", xml, re.DOTALL)
-    entries = re.findall(r"<p:sldId\b[^>]*>", lst.group(1)) if lst else []
+    entries = _sld_id_entries(_read_part(updated, pres_path))
     position = next(
-        (i for i, e in enumerate(entries, 1) if f'r:id="{rid}"' in e), len(entries)
+        (
+            i
+            for i, e in enumerate(entries, 1)
+            if e.attrib.get(R_ID) == rid and e.attrib.get("id") == str(slide_id)
+        ),
+        None,
     )
+    if position is None:
+        _die(f"could not add {rid} to <p:sldIdLst> in presentation.xml")
+
+    pres_path.write_bytes(updated)
     return position, len(entries)
 
 
