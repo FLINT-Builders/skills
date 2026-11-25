@@ -786,7 +786,7 @@
         dlBtn.textContent = "Download";
         dlBtn.download = file.name;
         dlBtn.href = getDownloadUri(file);
-        header.appendChild(dlBtn);
+        if (file.type !== "omitted") header.appendChild(dlBtn);
         fileDiv.appendChild(header);
 
         const content = document.createElement("div");
@@ -818,6 +818,10 @@
           const pre = document.createElement("pre");
           pre.textContent = file.content;
           pre.style.color = "var(--red)";
+          content.appendChild(pre);
+        } else if (file.type === "omitted") {
+          const pre = document.createElement("pre");
+          pre.textContent = file.content;
           content.appendChild(pre);
         }
 
@@ -946,7 +950,7 @@
         dlBtn.textContent = "Download";
         dlBtn.download = file.name;
         dlBtn.href = getDownloadUri(file);
-        header.appendChild(dlBtn);
+        if (file.type !== "omitted") header.appendChild(dlBtn);
         fileDiv.appendChild(header);
 
         const fc = document.createElement("div");
@@ -974,6 +978,10 @@
           a.download = file.name;
           a.textContent = "Download " + file.name;
           fc.appendChild(a);
+        } else if (file.type === "omitted" || file.type === "error") {
+          const pre = document.createElement("pre");
+          pre.textContent = file.content;
+          fc.appendChild(pre);
         }
 
         fileDiv.appendChild(fc);

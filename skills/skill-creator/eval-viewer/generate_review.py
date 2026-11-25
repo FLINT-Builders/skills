@@ -19,6 +19,7 @@ import mimetypes
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -47,6 +48,65 @@ MIME_OVERRIDES = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
+
+# Output files are written by the skill under evaluation, so their size is
+# untrusted. Limits are raw file bytes, counted before base64/JSON encoding.
+MAX_EMBEDDED_FILE_BYTES = 256 * 1024
+# Shared by current and previous-iteration outputs within one generated page.
+MAX_TOTAL_EMBEDDED_BYTES = 1024 * 1024
+# Workspace JSON metadata and feedback, which are read but not inlined as outputs.
+# transcript.md is only scanned for the prompt, from its first MAX_EMBEDDED_FILE_BYTES.
+MAX_METADATA_BYTES = 4 * 1024 * 1024
+
+_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+_READ_CHUNK_BYTES = 64 * 1024
+
+
+class _OversizedFile(Exception):
+    pass
+
+
+def _read_capped(path: Path, limit: int, truncate: bool = False) -> bytes:
+    """Read at most ``limit`` bytes of a regular file without following a final symlink.
+
+    The size check and the read use the same open descriptor, so swapping the
+    path after the check cannot change what gets read. Raises _OversizedFile
+    when the file is larger than ``limit`` (unless ``truncate``), and OSError
+    when it cannot be opened or is not a regular file.
+    """
+    fd = os.open(path, _OPEN_FLAGS)
+    with os.fdopen(fd, "rb", buffering=0) as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(f"{path} is not a regular file")
+        if info.st_size > limit and not truncate:
+            raise _OversizedFile(info.st_size)
+        # Chunked so a small file never allocates a limit-sized buffer, and a
+        # file that grows after fstat is still cut off at limit + 1 bytes.
+        data = bytearray()
+        while len(data) <= limit:
+            chunk = handle.read(min(_READ_CHUNK_BYTES, limit + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+    if len(data) > limit:
+        if not truncate:
+            raise _OversizedFile(len(data))
+        del data[limit:]
+    return bytes(data)
+
+
+def _read_json_capped(path: Path):
+    """Parse a small workspace JSON file, or return None if it is missing, oversized, or invalid."""
+    try:
+        return json.loads(_read_capped(path, MAX_METADATA_BYTES))
+    except (_OversizedFile, OSError, ValueError):
+        return None
 
 
 def get_mime_type(path: Path) -> str:
@@ -90,12 +150,10 @@ def build_run(root: Path, run_dir: Path) -> dict | None:
     # Try eval_metadata.json
     for candidate in [run_dir / "eval_metadata.json", run_dir.parent / "eval_metadata.json"]:
         if candidate.exists():
-            try:
-                metadata = json.loads(candidate.read_text())
+            metadata = _read_json_capped(candidate)
+            if isinstance(metadata, dict):
                 prompt = metadata.get("prompt", "")
                 eval_id = metadata.get("eval_id")
-            except (json.JSONDecodeError, OSError):
-                pass
             if prompt:
                 break
 
@@ -104,7 +162,9 @@ def build_run(root: Path, run_dir: Path) -> dict | None:
         for candidate in [run_dir / "transcript.md", run_dir / "outputs" / "transcript.md"]:
             if candidate.exists():
                 try:
-                    text = candidate.read_text()
+                    text = _read_capped(candidate, MAX_EMBEDDED_FILE_BYTES, truncate=True).decode(
+                        "utf-8", errors="replace"
+                    )
                     match = re.search(r"## Eval Prompt\n\n([\s\S]*?)(?=\n##|$)", text)
                     if match:
                         prompt = match.group(1).strip()
@@ -118,22 +178,20 @@ def build_run(root: Path, run_dir: Path) -> dict | None:
 
     run_id = str(run_dir.relative_to(root)).replace("/", "-").replace("\\", "-")
 
-    # Collect output files
+    # Collect output file paths; contents are embedded per page by generate_html
+    # so that every page draws from one size budget.
     outputs_dir = run_dir / "outputs"
-    output_files: list[dict] = []
+    output_files: list[Path] = []
     if outputs_dir.is_dir():
         for f in sorted(outputs_dir.iterdir()):
             if f.is_file() and f.name not in METADATA_FILES:
-                output_files.append(embed_file(f))
+                output_files.append(f)
 
     # Load grading if present
     grading = None
     for candidate in [run_dir / "grading.json", run_dir.parent / "grading.json"]:
         if candidate.exists():
-            try:
-                grading = json.loads(candidate.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
+            grading = _read_json_capped(candidate)
             if grading:
                 break
 
@@ -146,27 +204,56 @@ def build_run(root: Path, run_dir: Path) -> dict | None:
     }
 
 
-def embed_file(path: Path) -> dict:
-    """Read a file and return an embedded representation."""
+class EmbedBudget:
+    """Raw output bytes one generated page may still inline."""
+
+    def __init__(self, total: int = MAX_TOTAL_EMBEDDED_BYTES):
+        self.remaining = total
+
+
+def _omitted(path: Path, reason: str) -> dict:
+    return {
+        "name": path.name,
+        "type": "omitted",
+        "content": f"{reason} Open it from disk: {path}",
+    }
+
+
+def embed_file(path: Path, budget: EmbedBudget) -> dict:
+    """Read a file and return an embedded representation.
+
+    Files over MAX_EMBEDDED_FILE_BYTES, or over what is left of ``budget``,
+    are replaced with a placeholder and never read in full. Symlinks and
+    non-regular files are not embedded.
+    """
     ext = path.suffix.lower()
     mime = get_mime_type(path)
 
+    limit = min(MAX_EMBEDDED_FILE_BYTES, budget.remaining)
+    try:
+        raw = _read_capped(path, limit)
+    except _OversizedFile as exc:
+        size = exc.args[0]
+        if size > MAX_EMBEDDED_FILE_BYTES:
+            reason = f"File is too large to embed ({size} bytes; limit {MAX_EMBEDDED_FILE_BYTES})."
+        else:
+            reason = f"Not embedded: this page's {MAX_TOTAL_EMBEDDED_BYTES}-byte output budget is used up."
+        return _omitted(path, reason)
+    except OSError:
+        if path.is_symlink():
+            return _omitted(path, "Symlinked outputs are not embedded.")
+        return {"name": path.name, "type": "error", "content": "(Error reading file)"}
+    budget.remaining -= len(raw)
+
     if ext in TEXT_EXTENSIONS:
-        try:
-            content = path.read_text(errors="replace")
-        except OSError:
-            content = "(Error reading file)"
         return {
             "name": path.name,
             "type": "text",
-            "content": content,
+            "content": raw.decode("utf-8", errors="replace"),
         }
-    elif ext in IMAGE_EXTENSIONS:
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    if ext in IMAGE_EXTENSIONS:
         return {
             "name": path.name,
             "type": "image",
@@ -174,22 +261,12 @@ def embed_file(path: Path) -> dict:
             "data_uri": f"data:{mime};base64,{b64}",
         }
     elif ext == ".pdf":
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
             "name": path.name,
             "type": "pdf",
             "data_uri": f"data:{mime};base64,{b64}",
         }
     elif ext == ".xlsx":
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
             "name": path.name,
             "type": "xlsx",
@@ -197,11 +274,6 @@ def embed_file(path: Path) -> dict:
         }
     else:
         # Binary / unknown — base64 download link
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
             "name": path.name,
             "type": "binary",
@@ -213,7 +285,8 @@ def embed_file(path: Path) -> dict:
 def load_previous_iteration(workspace: Path) -> dict[str, dict]:
     """Load previous iteration's feedback and outputs.
 
-    Returns a map of run_id -> {"feedback": str, "outputs": list[dict]}.
+    Returns a map of run_id -> {"feedback": str, "outputs": list[Path]}.
+    Output contents are embedded later, per page, by generate_html.
     """
     result: dict[str, dict] = {}
 
@@ -221,14 +294,14 @@ def load_previous_iteration(workspace: Path) -> dict[str, dict]:
     feedback_map: dict[str, str] = {}
     feedback_path = workspace / "feedback.json"
     if feedback_path.exists():
+        data = _read_json_capped(feedback_path)
         try:
-            data = json.loads(feedback_path.read_text())
             feedback_map = {
                 r["run_id"]: r["feedback"]
                 for r in data.get("reviews", [])
                 if r.get("feedback", "").strip()
             }
-        except (json.JSONDecodeError, OSError, KeyError):
+        except (AttributeError, KeyError, TypeError):
             pass
 
     # Load runs (to get outputs)
@@ -257,6 +330,13 @@ def generate_html(
     template_path = Path(__file__).parent / "viewer.html"
     template = template_path.read_text()
 
+    # One budget per page: current runs first, then previous-iteration runs.
+    budget = EmbedBudget()
+    embedded_runs = [
+        {**run, "outputs": [embed_file(p, budget) for p in run.get("outputs", [])]}
+        for run in runs
+    ]
+
     # Build previous_feedback and previous_outputs maps for the template
     previous_feedback: dict[str, str] = {}
     previous_outputs: dict[str, list[dict]] = {}
@@ -265,11 +345,11 @@ def generate_html(
             if data.get("feedback"):
                 previous_feedback[run_id] = data["feedback"]
             if data.get("outputs"):
-                previous_outputs[run_id] = data["outputs"]
+                previous_outputs[run_id] = [embed_file(p, budget) for p in data["outputs"]]
 
     embedded = {
         "skill_name": skill_name,
-        "runs": runs,
+        "runs": embedded_runs,
         "previous_feedback": previous_feedback,
         "previous_outputs": previous_outputs,
     }
@@ -335,10 +415,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             runs = find_runs(self.workspace)
             benchmark = None
             if self.benchmark_path and self.benchmark_path.exists():
-                try:
-                    benchmark = json.loads(self.benchmark_path.read_text())
-                except (json.JSONDecodeError, OSError):
-                    pass
+                benchmark = _read_json_capped(self.benchmark_path)
             html = generate_html(runs, self.skill_name, self.previous, benchmark)
             content = html.encode("utf-8")
             self.send_response(200)
@@ -349,7 +426,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/feedback":
             data = b"{}"
             if self.feedback_path.exists():
-                data = self.feedback_path.read_bytes()
+                try:
+                    data = _read_capped(self.feedback_path, MAX_METADATA_BYTES)
+                except (_OversizedFile, OSError):
+                    pass
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -360,7 +440,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = -1
+            if not 0 <= length <= MAX_METADATA_BYTES:
+                self.send_error(413)
+                return
             body = self.rfile.read(length)
             try:
                 data = json.loads(body)
@@ -423,10 +509,7 @@ def main() -> None:
     benchmark_path = args.benchmark.resolve() if args.benchmark else None
     benchmark = None
     if benchmark_path and benchmark_path.exists():
-        try:
-            benchmark = json.loads(benchmark_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
+        benchmark = _read_json_capped(benchmark_path)
 
     if args.static:
         html = generate_html(runs, skill_name, previous, benchmark)
