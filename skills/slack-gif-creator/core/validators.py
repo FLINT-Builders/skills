@@ -7,6 +7,11 @@ These validators help ensure your GIFs meet Slack's size and dimension constrain
 
 from pathlib import Path
 
+# GIFs carry no frame count, and each seek decodes the previous frame onto the
+# full canvas, so the frame walk is bounded by frames and by total canvas pixels.
+MAX_FRAMES = 300
+MAX_SCAN_PIXELS = MAX_FRAMES * 1024 * 1024
+
 
 def validate_gif(
     gif_path: str | Path, is_emoji: bool = True, verbose: bool = True
@@ -39,10 +44,22 @@ def validate_gif(
         with Image.open(gif_path) as img:
             width, height = img.size
 
-            # Count frames
-            frame_count = 0
+            # Image.open leaves the GIF on frame 0. Later frames can enlarge the
+            # canvas, so its current size is charged before every seek.
+            frame_count = 1
+            scanned_pixels = 0
             try:
                 while True:
+                    if frame_count > MAX_FRAMES:
+                        return False, {
+                            "error": f"Too many frames: more than {MAX_FRAMES}"
+                        }
+                    canvas_width, canvas_height = img.size
+                    scanned_pixels += canvas_width * canvas_height
+                    if scanned_pixels > MAX_SCAN_PIXELS:
+                        return False, {
+                            "error": f"Too many frames for a {canvas_width}x{canvas_height} canvas"
+                        }
                     img.seek(frame_count)
                     frame_count += 1
             except EOFError:
