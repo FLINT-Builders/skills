@@ -624,10 +624,52 @@ FastMCP supports two main transport mechanisms:
 # stdio transport (for local tools) - default
 if __name__ == "__main__":
     mcp.run()
+```
 
-# Streamable HTTP transport (for remote servers)
+For streamable HTTP, `host` and `port` are `FastMCP` constructor settings, not `run()` arguments. Keep the default `host="127.0.0.1"` for a server used on the local machine; on a loopback host FastMCP also rejects requests whose `Host` or `Origin` header is not localhost (DNS rebinding protection):
+
+```python
+# Streamable HTTP transport (local machine only)
+mcp = FastMCP("service_mcp", host="127.0.0.1", port=8000)
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable_http", port=8000)
+    mcp.run(transport="streamable-http")
+```
+
+A server reachable from other machines must authenticate every request before any tool runs. Pass a `token_verifier` and `auth` settings so FastMCP rejects requests without a valid bearer token, and restrict the accepted `Host` and `Origin` headers. Never bind a streamable HTTP server to a non-loopback address without authentication:
+
+```python
+from mcp.server.auth.provider import AccessToken, TokenVerifier
+from mcp.server.auth.settings import AuthSettings
+from mcp.server.transport_security import TransportSecuritySettings
+
+class ServiceTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        # Validate the token with your OAuth 2.1 authorization server (signature or
+        # introspection, expiry, audience) and return an AccessToken.
+        # Returning None rejects the request with 401.
+        return None
+
+# Streamable HTTP transport (remote servers)
+mcp = FastMCP(
+    "service_mcp",
+    host="0.0.0.0",
+    port=8000,
+    token_verifier=ServiceTokenVerifier(),
+    auth=AuthSettings(
+        issuer_url="https://auth.example.com",
+        resource_server_url="https://mcp.example.com/mcp",
+        validate_token_resource=True,
+    ),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["mcp.example.com"],
+        allowed_origins=["https://mcp.example.com"],
+    ),
+)
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
 ```
 
 **Transport selection:**
@@ -702,6 +744,7 @@ Before finalizing your Python MCP server implementation, ensure:
 - [ ] Lifespan management implemented for persistent connections
 - [ ] Structured output types used (TypedDict, Pydantic models)
 - [ ] Appropriate transport configured (stdio or streamable HTTP)
+- [ ] Streamable HTTP servers bind to `127.0.0.1` when local, and authenticate every request when reachable from other machines
 
 ### Code Quality
 - [ ] File includes proper imports including Pydantic imports

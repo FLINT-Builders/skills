@@ -51,7 +51,7 @@ Key pages to review:
 
 **Recommended stack:**
 - **Language**: TypeScript (high-quality SDK support and good compatibility in many execution environments e.g. MCPB. Plus AI models are good at generating TypeScript code, benefiting from its broad usage, static typing and good linting tools)
-- **Transport**: Streamable HTTP for remote servers, using stateless JSON (simpler to scale and maintain, as opposed to stateful sessions and streaming responses). stdio for local servers.
+- **Transport**: Streamable HTTP for remote servers, using stateless JSON (simpler to scale and maintain, as opposed to stateful sessions and streaming responses). stdio for local servers. A streamable HTTP server must authenticate every request and validate `Origin`, and must bind to `127.0.0.1` when used only locally.
 
 **Load framework documentation:**
 
