@@ -32,6 +32,7 @@ from typing import NoReturn
 import tempfile
 import zipfile
 from pathlib import Path
+from xml.sax.saxutils import quoteattr
 
 from office.helpers import rezip, safe_extract
 
@@ -64,6 +65,11 @@ SHARED_PART_TYPES = ("chart", "diagramData", "oleObject", "package")
 NOTES_SLIDE_TYPE_RE = re.compile(r"""Type=["'][^"']*/relationships/notesSlide["']""")
 RELATIONSHIP_RE = re.compile(r"<Relationship\b[^>]*?(?:/>|>.*?</Relationship\s*>)", re.DOTALL)
 
+# Source names are joined onto a package directory and the layout name is written
+# into the new slide's .rels, so only a single plain part name is accepted.
+LAYOUT_NAME_RE = re.compile(r"slideLayout[0-9]+\.xml")
+SLIDE_NAME_RE = re.compile(r"slide[0-9]+\.xml")
+
 SLIDE_ID_MIN = 256
 SLIDE_ID_MAX = 2147483647
 
@@ -80,18 +86,24 @@ def get_next_slide_number(slides_dir: Path) -> int:
 
 
 def parse_source(source: str) -> tuple[str, str | None]:
-    if source.startswith("slideLayout") and source.endswith(".xml"):
+    if source.startswith("slideLayout"):
+        if not LAYOUT_NAME_RE.fullmatch(source):
+            _die(f"invalid layout name {source!r}: expected slideLayoutN.xml")
         return ("layout", source)
 
+    if not SLIDE_NAME_RE.fullmatch(source):
+        _die(f"invalid source {source!r}: expected slideN.xml or slideLayoutN.xml")
     return ("slide", None)
 
 
 def create_slide_from_layout(unpacked_dir: Path, layout_file: str, after: str | None = None) -> str:
+    if not LAYOUT_NAME_RE.fullmatch(layout_file):
+        _die(f"invalid layout name {layout_file!r}: expected slideLayoutN.xml")
     slides_dir = unpacked_dir / "ppt" / "slides"
     rels_dir = slides_dir / "_rels"
     layout_path = unpacked_dir / "ppt" / "slideLayouts" / layout_file
 
-    if not layout_path.exists():
+    if not layout_path.is_file():
         _die(f"{layout_path} not found")
 
     next_num = get_next_slide_number(slides_dir)
@@ -104,7 +116,7 @@ def create_slide_from_layout(unpacked_dir: Path, layout_file: str, after: str | 
     rels_dir.mkdir(exist_ok=True)
     rels_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target="../slideLayouts/{layout_file}"/>
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout" Target={quoteattr(f"../slideLayouts/{layout_file}")}/>
 </Relationships>'''
     (rels_dir / f"{dest}.rels").write_text(rels_xml, encoding="utf-8")
 
@@ -113,11 +125,13 @@ def create_slide_from_layout(unpacked_dir: Path, layout_file: str, after: str | 
 
 
 def duplicate_slide(unpacked_dir: Path, source: str, after: str | None = None) -> str:
+    if not SLIDE_NAME_RE.fullmatch(source):
+        _die(f"invalid source {source!r}: expected slideN.xml")
     slides_dir = unpacked_dir / "ppt" / "slides"
     rels_dir = slides_dir / "_rels"
     source_slide = slides_dir / source
 
-    if not source_slide.exists():
+    if not source_slide.is_file():
         _die(f"{source_slide} not found")
 
     next_num = get_next_slide_number(slides_dir)
@@ -315,6 +329,7 @@ def add_slide(unpacked_dir: Path, source: str, after: str | None = None) -> str:
 def add_slide_to_package(
     package: Path, source: str, after: str | None = None, output: Path | None = None
 ) -> str:
+    parse_source(source)
     out = output or package
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
