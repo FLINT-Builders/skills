@@ -13,6 +13,10 @@ the env dict carries the shim but names no user profile, and a non-root sandbox
 cannot bootstrap the default one -- soffice aborts with "User installation could
 not be completed" and converts nothing. get_soffice_env() stays public for the
 callers that build their own argv (they must pass -env:UserInstallation too).
+
+For a PDF that will be rasterized for preview, use export_pdf (CLI:
+`soffice.py --pdf input.pptx out.pdf`). It refuses documents with more than
+DEFAULT_MAX_PDF_PAGES pages before any PDF is written, and never exports more.
 """
 
 import contextlib
@@ -22,6 +26,13 @@ import subprocess
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
+from xml.sax.saxutils import escape
+
+DEFAULT_MAX_PDF_PAGES = 40
+
+
+class PageLimitError(RuntimeError):
+    pass
 
 
 def get_soffice_env() -> dict:
@@ -44,6 +55,172 @@ def run_soffice(args: Iterable[str], **kwargs) -> subprocess.CompletedProcess:
             )
             args = [f"-env:UserInstallation={Path(profile).as_uri()}"] + args
         return subprocess.run(["soffice"] + args, env=get_soffice_env(), **kwargs)
+
+
+def export_pdf(
+    source,
+    target,
+    max_pages: int = DEFAULT_MAX_PDF_PAGES,
+    timeout: float = 300,
+) -> int:
+    """Export a text or presentation document to PDF; return its page count.
+
+    The page count is read from the document LibreOffice loaded, and that same
+    loaded document is exported, so the file cannot change between the check
+    and the export. Raises PageLimitError, without writing target, when the
+    document has more than max_pages pages. The export itself is restricted to
+    pages 1..max_pages.
+    """
+    source_path = Path(source).resolve(strict=True)
+    target_path = Path(target).absolute()
+    if target_path.suffix.lower() != ".pdf":
+        raise ValueError(f"PDF target must end in .pdf: {target}")
+    if not target_path.parent.is_dir():
+        raise FileNotFoundError(f"Output directory does not exist: {target_path.parent}")
+    if max_pages < 1:
+        raise ValueError("max_pages must be at least 1")
+
+    env = get_soffice_env()
+    with tempfile.TemporaryDirectory(
+        prefix="lo_profile_", ignore_cleanup_errors=True
+    ) as profile_dir:
+        profile = Path(profile_dir)
+        profile_arg = f"-env:UserInstallation={profile.as_uri()}"
+        try:
+            subprocess.run(
+                ["soffice", profile_arg, "--headless", "--norestore", "--terminate_after_init"],
+                env=env,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            library = profile / "user" / "basic" / "Standard"
+            if not library.is_dir():
+                raise RuntimeError("LibreOffice did not create its user profile")
+            (library / f"{_EXPORT_MODULE}.xba").write_text(_export_module_xml(), encoding="utf-8")
+            (library / "script.xlb").write_text(_EXPORT_LIBRARY_XML, encoding="utf-8")
+
+            status = profile / "export-status.txt"
+            env.update(
+                SKILLS_PDF_SOURCE=str(source_path),
+                SKILLS_PDF_TARGET=str(target_path),
+                SKILLS_PDF_MAX_PAGES=str(max_pages),
+                SKILLS_PDF_STATUS=str(status),
+            )
+            result = subprocess.run(
+                [
+                    "soffice",
+                    profile_arg,
+                    "--headless",
+                    "--invisible",
+                    "--norestore",
+                    f"macro:///Standard.{_EXPORT_MODULE}.Run",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"PDF export timed out after {timeout:g}s") from None
+        outcome = status.read_text(encoding="utf-8").strip() if status.exists() else ""
+
+    kind, _, detail = outcome.partition(" ")
+    if kind == "OK" and target_path.exists():
+        return int(detail)
+    if kind == "LIMIT":
+        raise PageLimitError(
+            f"{source_path.name} has {detail} pages; PDF export for preview is "
+            f"limited to {max_pages}"
+        )
+    if kind == "UNSUPPORTED":
+        raise RuntimeError(f"{source_path.name} is not a text or presentation document")
+    detail = detail or (result.stderr or "").strip() or "no result from LibreOffice"
+    raise RuntimeError(f"PDF export failed: {detail}")
+
+
+_EXPORT_MODULE = "SkillsPdfExport"
+
+# Runs inside soffice: load once, count pages on the loaded model, export it.
+_EXPORT_BASIC = """
+Sub Run
+    Dim sResult As String
+    Dim oDoc As Object
+    Dim sFilter As String
+    Dim nPages As Long
+    Dim nMax As Long
+    On Error GoTo Failed
+    nMax = CLng(Environ("SKILLS_PDF_MAX_PAGES"))
+    Dim aLoad(3) As New com.sun.star.beans.PropertyValue
+    aLoad(0).Name = "Hidden" : aLoad(0).Value = True
+    aLoad(1).Name = "ReadOnly" : aLoad(1).Value = True
+    aLoad(2).Name = "MacroExecutionMode"
+    aLoad(2).Value = com.sun.star.document.MacroExecMode.NEVER_EXECUTE
+    aLoad(3).Name = "UpdateDocMode"
+    aLoad(3).Value = com.sun.star.document.UpdateDocMode.NO_UPDATE
+    oDoc = StarDesktop.loadComponentFromURL( _
+        ConvertToURL(Environ("SKILLS_PDF_SOURCE")), "_blank", 0, aLoad())
+    If IsNull(oDoc) Then
+        sResult = "ERROR LibreOffice could not open the document"
+        GoTo Finish
+    End If
+    If oDoc.supportsService("com.sun.star.text.TextDocument") Then
+        sFilter = "writer_pdf_Export"
+        nPages = oDoc.getCurrentController().getPropertyValue("PageCount")
+    ElseIf oDoc.supportsService("com.sun.star.presentation.PresentationDocument") Then
+        sFilter = "impress_pdf_Export"
+        nPages = oDoc.getDrawPages().getCount()
+    ElseIf oDoc.supportsService("com.sun.star.drawing.DrawingDocument") Then
+        sFilter = "draw_pdf_Export"
+        nPages = oDoc.getDrawPages().getCount()
+    Else
+        sResult = "UNSUPPORTED"
+        GoTo Finish
+    End If
+    If nPages > nMax Then
+        sResult = "LIMIT " & nPages
+        GoTo Finish
+    End If
+    Dim aFilterData(0) As New com.sun.star.beans.PropertyValue
+    aFilterData(0).Name = "PageRange" : aFilterData(0).Value = "1-" & nMax
+    Dim aStore(1) As New com.sun.star.beans.PropertyValue
+    aStore(0).Name = "FilterName" : aStore(0).Value = sFilter
+    aStore(1).Name = "FilterData" : aStore(1).Value = aFilterData()
+    oDoc.storeToURL(ConvertToURL(Environ("SKILLS_PDF_TARGET")), aStore())
+    sResult = "OK " & nPages
+    GoTo Finish
+Failed:
+    sResult = "ERROR " & Error$
+    Resume Finish
+Finish:
+    On Error Resume Next
+    If Not IsNull(oDoc) Then oDoc.close(True)
+    Dim iFile As Integer
+    iFile = FreeFile
+    Open Environ("SKILLS_PDF_STATUS") For Output As #iFile
+    Print #iFile, sResult
+    Close #iFile
+    StarDesktop.terminate()
+End Sub
+"""
+
+_EXPORT_LIBRARY_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE library:library PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "library.dtd">
+<library:library xmlns:library="http://openoffice.org/2000/library" library:name="Standard" library:readonly="false" library:passwordprotected="false">
+ <library:element library:name="{_EXPORT_MODULE}"/>
+</library:library>
+"""
+
+
+def _export_module_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">\n'
+        '<script:module xmlns:script="http://openoffice.org/2000/script" '
+        f'script:name="{_EXPORT_MODULE}" script:language="StarBasic">'
+        f"{escape(_EXPORT_BASIC, {chr(34): '&quot;'})}</script:module>\n"
+    )
 
 
 
@@ -188,5 +365,18 @@ int close(int fd) {
 
 if __name__ == "__main__":
     import sys
+
+    if sys.argv[1:2] == ["--pdf"]:
+        if len(sys.argv) != 4:
+            print("Usage: soffice.py --pdf INPUT OUTPUT.pdf", file=sys.stderr)
+            sys.exit(2)
+        try:
+            pages = export_pdf(sys.argv[2], sys.argv[3])
+        except (OSError, RuntimeError, ValueError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Wrote {pages} page(s) to {Path(sys.argv[3]).absolute()}")
+        sys.exit(0)
+
     result = run_soffice(sys.argv[1:])
     sys.exit(result.returncode)

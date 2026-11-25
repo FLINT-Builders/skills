@@ -20,11 +20,11 @@ Paths are relative to this skill's directory. Everything else is plain Python, `
 
 | Script | What it does |
 |---|---|
-| `scripts/thumbnail.py deck.pptx [prefix]` | Labeled grid of every slide, for picking template layouts. `.pptx` only. Pass `prefix` — it defaults to `thumbnails`, which overwrites the grids of any other deck done in the same directory |
+| `scripts/thumbnail.py deck.pptx [prefix]` | Labeled grid of every slide, for picking template layouts. `.pptx` only, at most 40 slides. Pass `prefix` — it defaults to `thumbnails`, which overwrites the grids of any other deck done in the same directory |
 | `scripts/add_slide.py unpacked/ slide2.xml [--after slideN.xml]` | Duplicate a slide (or a `slideLayoutN.xml`) with all the package bookkeeping. Also takes a `.pptx` directly with `-o out.pptx` |
 | `scripts/clean.py unpacked/` | Delete slides, media, and rels no longer referenced. Run **after** `<p:sldIdLst>` is final |
 | `scripts/office/validate.py deck.pptx [--original src.pptx]` | Schema, relationship, content-type, chart and slide checks; each failure names its fix. Pass `--original` for any template-derived deck — it baselines the schema checks against the template, so the template's own XSD errors don't read as yours |
-| `scripts/office/soffice.py --headless --convert-to pdf deck.pptx` | LibreOffice wrapper — bare `soffice` hangs in this sandbox |
+| `scripts/office/soffice.py --pdf deck.pptx out.pdf` | PDF for previewing; refuses decks over 40 slides before writing anything. Other arguments pass straight to LibreOffice (e.g. `--headless --convert-to pptx file.ppt`) — bare `soffice` hangs in this sandbox |
 
 ## Creating with pptxgenjs — gotchas
 
@@ -223,15 +223,17 @@ Convert the slides to images (see [Converting to Images](#converting-to-images))
 Convert presentations to individual slide images for visual inspection:
 
 ```bash
-python scripts/office/soffice.py --headless --convert-to pdf output.pptx
-rm -f slide-*.jpg
-pdftoppm -jpeg -r 150 output.pdf slide
-ls -1 "$PWD"/slide-*.jpg
+QA_DIR="$(mktemp -d)" &&
+python scripts/office/soffice.py --pdf output.pptx "$QA_DIR/output.pdf" &&
+pdftoppm -jpeg -scale-to 1500 -l 40 "$QA_DIR/output.pdf" "$QA_DIR/slide" &&
+ls -1 "$QA_DIR"/slide-*.jpg
 ```
 
-**Pass the absolute paths printed above directly to the view tool.** The `rm` clears stale images from prior runs. `pdftoppm` zero-pads based on page count: `slide-1.jpg` for decks under 10 pages, `slide-01.jpg` for 10-99, `slide-001.jpg` for 100+.
+**Pass the absolute paths printed above directly to the view tool.** Each run renders into a fresh temporary directory, so images from earlier runs never mix in and nothing in the working directory is touched. `-scale-to 1500` makes each image's longer edge 1500 px (150 DPI on the default 10" canvas) whatever the slide size. `pdftoppm` zero-pads based on page count: `slide-1.jpg` for decks under 10 pages, `slide-01.jpg` for 10-40.
 
-**After fixes, rerun all four commands above** — the PDF must be regenerated from the edited `.pptx` before `pdftoppm` can reflect your changes.
+Decks over 40 slides are refused before any PDF is written. To check a longer deck, save a copy that keeps only the slides you need to look at, and render that.
+
+**After fixes, rerun the whole block** — the PDF must be regenerated from the edited `.pptx` before `pdftoppm` can reflect your changes.
 
 ## Dependencies
 
