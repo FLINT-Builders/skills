@@ -1,6 +1,7 @@
 import os
 import posixpath
 import re
+import shutil
 import stat
 import tempfile
 import urllib.parse
@@ -80,6 +81,88 @@ def safe_extract(zf: zipfile.ZipFile, dest: Path) -> None:
         if not target.is_relative_to(dest):
             raise ValueError(f"unsafe archive entry: {m.filename!r}")
         zf.extract(m, dest)
+
+
+_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _CLOEXEC
+_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | _CLOEXEC
+
+
+def _member_parts(m: zipfile.ZipInfo) -> list[str]:
+    if stat.S_ISLNK(m.external_attr >> 16):
+        raise ValueError(f"symlink archive entry not allowed: {m.filename!r}")
+    name = m.filename
+    if name.endswith("/"):
+        name = name[:-1]
+    parts = name.split("/")
+    if "\\" in name or "\0" in name or any(p in ("", ".", "..") for p in parts):
+        raise ValueError(f"unsafe archive entry: {m.filename!r}")
+    return parts
+
+
+def _open_subdir(parent_fd: int, name: str) -> int:
+    try:
+        os.mkdir(name, 0o777, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+
+
+def extract_to_new_dir(zf: zipfile.ZipFile, dest: Path) -> None:
+    """Create `dest` and extract every member into it.
+
+    Refuses when anything, including a symlink, already exists at `dest`.
+    Members are written through descriptors of the directory created here,
+    never through the path, which another user may swap for a link.
+    """
+    members = [(m, _member_parts(m)) for m in zf.infolist()]
+    dest = Path(dest)
+    if dest.name in ("", ".", ".."):
+        raise ValueError(f"not a new directory name: {str(dest)!r}")
+
+    parent_fd = os.open(dest.parent, os.O_RDONLY | os.O_DIRECTORY | _CLOEXEC)
+    try:
+        try:
+            os.mkdir(dest.name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            raise FileExistsError(
+                f"{dest} already exists; unpack into a new directory"
+            ) from None
+        root_fd = os.open(dest.name, _DIR_FLAGS, dir_fd=parent_fd)
+        try:
+            st = os.fstat(root_fd)
+            if (
+                not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.geteuid()
+                or os.listdir(root_fd)
+            ):
+                raise ValueError(f"{dest} was replaced while it was being created")
+            for m, parts in members:
+                opened: list[int] = []
+                try:
+                    cur = root_fd
+                    dirs = parts if m.is_dir() else parts[:-1]
+                    for part in dirs:
+                        cur = _open_subdir(cur, part)
+                        opened.append(cur)
+                    if m.is_dir():
+                        continue
+                    out = os.open(parts[-1], _FILE_FLAGS, 0o666, dir_fd=cur)
+                    with os.fdopen(out, "wb") as fh, zf.open(m) as src:
+                        shutil.copyfileobj(src, fh)
+                finally:
+                    for fd in opened:
+                        os.close(fd)
+            try:
+                now = os.stat(dest.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                now = None
+            if now is None or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                raise ValueError(f"{dest} was moved or replaced while unpacking")
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def rezip(src_dir: Path, out_path: Path) -> None:
