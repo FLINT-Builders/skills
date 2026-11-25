@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from office.soffice import get_soffice_env, run_soffice
@@ -26,6 +27,25 @@ SOFFICE_MISSING = "soffice not found on PATH; LibreOffice is required to recalcu
 MAX_LOCATIONS = 100
 
 EXTERNAL_REF_RE = re.compile(r"""(?<![\w"\[])'?\[\d+\][^!"\[\]]*'?!""")
+
+# Functions that make LibreOffice fetch a URL (or parse what was fetched) while
+# it recalculates. Matched with or without a prefix such as _xlfn.
+WEB_FUNCTION_RE = re.compile(r"(?<![A-Za-z0-9_])(WEBSERVICE|FILTERXML)\s*\(", re.IGNORECASE)
+
+# OOXML elements and attributes whose content is a formula LibreOffice evaluates:
+# cell formulas, defined names, conditional formats, data validation, table
+# columns, chart references, and pivot calculated fields/items.
+FORMULA_ELEMENTS = {
+    "f",
+    "formula",
+    "formula1",
+    "formula2",
+    "definedName",
+    "calculatedColumnFormula",
+    "totalsRowFormula",
+}
+FORMULA_ATTRIBUTES = {"formula"}
+XML_SIGNATURES = (b"<", b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
 
 RECALCULATE_MACRO = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE script:module PUBLIC "-//OpenOffice.org//DTD OfficeDocument 1.0//EN" "module.dtd">
@@ -78,6 +98,57 @@ def setup_libreoffice_macro(profile_dir: Path, timeout=30):
     return url, None
 
 
+def _local_name(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def web_function_uses(filename):
+    """Return (location, function) for every web function in a formula.
+
+    Parses every XML member of the package whatever its name, so neither a
+    renamed part nor a character reference can hide a function name. Text
+    cells are not formulas and are not inspected.
+    """
+    found = []
+    with zipfile.ZipFile(filename) as archive:
+        for name in archive.namelist():
+            with archive.open(name) as part:
+                head = part.read(64).lstrip(b" \t\r\n")
+            if not head.startswith(XML_SIGNATURES):
+                continue
+            current_cell = None
+            with archive.open(name) as part:
+                for event, elem in ET.iterparse(part, events=("start", "end")):
+                    tag = _local_name(elem.tag)
+                    if event == "start":
+                        if tag == "c":
+                            current_cell = elem.get("r")
+                        continue
+                    texts = [elem.text] if tag in FORMULA_ELEMENTS else []
+                    texts += [v for k, v in elem.attrib.items() if _local_name(k) in FORMULA_ATTRIBUTES]
+                    for text in texts:
+                        functions = {m.group(1).upper() for m in WEB_FUNCTION_RE.finditer(text or "")}
+                        where = f"{name}!{current_cell}" if tag == "f" and current_cell else name
+                        found.extend((where, fn) for fn in sorted(functions))
+                    if tag == "c":
+                        current_cell = None
+                    elem.clear()
+    return found
+
+
+def unsupported_package(filename):
+    if not zipfile.is_zipfile(filename):
+        return "it is not an .xlsx/.xlsm workbook (not a zip package)"
+    with zipfile.ZipFile(filename) as archive:
+        names = set(archive.namelist())
+        if "[Content_Types].xml" not in names or "mimetype" in names:
+            return "it is not an .xlsx/.xlsm workbook (not an Office Open XML package)"
+        content_types = archive.read("[Content_Types].xml")
+    if b"sheet.binary" in content_types:
+        return "it is a binary (.xlsb) workbook, whose formulas cannot be inspected"
+    return None
+
+
 def external_links_at_risk(filename):
     try:
         with zipfile.ZipFile(filename) as archive:
@@ -113,7 +184,7 @@ def external_links_at_risk(filename):
             for row in ws.iter_rows():
                 for cell in row:
                     v = cell.value
-                    if not (isinstance(v, str) and v.startswith("=")):
+                    if cell.data_type != "f" or not isinstance(v, str):
                         continue
                     reaches_out = EXTERNAL_REF_RE.search(v) or (name_re and name_re.search(v))
                     if reaches_out and cached[cell.coordinate].value is None:
@@ -129,6 +200,27 @@ def recalc(filename, timeout=30, force=False):
 
     if not os.access(abs_path, os.W_OK):
         return {"error": f"{filename} is not writable; recalculation rewrites the file in place"}
+
+    try:
+        unsupported = unsupported_package(abs_path)
+        web_uses = [] if unsupported else web_function_uses(abs_path)
+    except Exception as e:
+        return {"error": f"Refusing to recalculate: could not inspect {filename} for web functions: {e}"}
+    if unsupported:
+        return {"error": f"Refusing to recalculate {filename}: {unsupported}"}
+    if web_uses:
+        shown = web_uses[:MAX_LOCATIONS]
+        names = sorted({fn for _, fn in web_uses})
+        return {
+            "error": (
+                f"Refusing to recalculate: the workbook calls the web function(s) {', '.join(names)}, "
+                "which would make LibreOffice fetch a URL built from the workbook's own cells. "
+                "Nothing was evaluated or rewritten. If this text came from outside data, it must be "
+                "stored as text (scripts/external_cells.py), not as a formula; remove the formula otherwise."
+            ),
+            "web_function_cells": [where for where, _ in shown],
+            "web_function_cells_truncated": max(0, len(web_uses) - len(shown)),
+        }
 
     try:
         get_soffice_env()
@@ -263,11 +355,7 @@ def _recalc_with_profile(filename, abs_path, timeout, profile_dir: Path):
                 continue
             for row in ws.iter_rows():
                 for cell in row:
-                    if (
-                        cell.value
-                        and isinstance(cell.value, str)
-                        and cell.value.startswith("=")
-                    ):
+                    if cell.data_type == "f":
                         formula_count += 1
         wb_formulas.close()
 
@@ -294,6 +382,7 @@ def main():
         print("    - #VALUE!, #DIV/0!, #REF!, #NAME?, #NULL!, #NUM!, #N/A")
         print("\nOn any failure the JSON has an 'error' key and no 'status'.")
         print("--force recalculates even when it would destroy external links.")
+        print("Workbooks whose formulas call WEBSERVICE or FILTERXML are always refused.")
         sys.exit(1)
 
     filename = args[0]

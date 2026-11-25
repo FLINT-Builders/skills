@@ -115,7 +115,14 @@ with pdfplumber.open("document.pdf") as pdf:
 # Combine all tables
 if all_tables:
     combined_df = pd.concat(all_tables, ignore_index=True)
-    combined_df.to_excel("extracted_tables.xlsx", index=False)
+    # Text extracted from a PDF must stay text: a cell starting with "=" would
+    # otherwise be written as a live formula.
+    with pd.ExcelWriter("extracted_tables.xlsx", engine="openpyxl") as writer:
+        combined_df.to_excel(writer, index=False)
+        for row in writer.sheets["Sheet1"].iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str):
+                    cell.data_type = "s"
 ```
 
 ### reportlab - Create PDFs
