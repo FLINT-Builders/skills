@@ -19,11 +19,13 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-import defusedxml.ElementTree as ET
-from defusedxml.common import DefusedXmlException
-
 from helpers import OOXML_FAMILY, rezip, safe_extract
-from validators import DOCXSchemaValidator, PPTXSchemaValidator, RedliningValidator
+from validators import (
+    DOCXSchemaValidator,
+    PPTXSchemaValidator,
+    RedliningValidator,
+    load_story_parts,
+)
 
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -34,15 +36,11 @@ def _fail(message: str):
 
 
 def _has_tracked_changes(unpacked_dir: Path) -> bool:
-    document = unpacked_dir / "word" / "document.xml"
-    if not document.is_file():
-        return False
-    try:
-        root = ET.parse(document).getroot()
-    except (ET.ParseError, DefusedXmlException):
-        return False  
+    parts, _ = load_story_parts(unpacked_dir)
     tracked = {f"{{{WORD_NS}}}ins", f"{{{WORD_NS}}}del"}
-    return any(elem.tag in tracked for elem in root.iter())
+    return any(
+        elem.tag in tracked for root in parts.values() for elem in root.iter()
+    )
 
 
 def main():
