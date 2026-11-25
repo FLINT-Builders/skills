@@ -1,0 +1,18 @@
+{
+  "name": "mcp-builder-http-exposure-tests",
+  "private": true,
+  "type": "module",
+  "description": "Fails while the mcp-builder streamable HTTP examples accept unauthenticated tool calls on a non-loopback bind.",
+  "scripts": {
+    "test": "node --test unauthenticated-http.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@types/express": "5.0.6",
+    "@types/node": "22.20.7",
+    "axios": "1.21.1",
+    "express": "5.3.0",
+    "typescript": "5.9.3",
+    "zod": "3.25.76"
+  }
+}
