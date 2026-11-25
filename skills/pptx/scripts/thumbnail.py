@@ -16,7 +16,9 @@ Examples:
 """
 
 import argparse
+import os
 import posixpath
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,6 +73,11 @@ def main():
         sys.exit(1)
 
     output_path = Path(f"{args.output_prefix}.jpg")
+    try:
+        _check_output_name(output_path)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         slide_info = get_slide_info(input_path)
@@ -221,27 +228,65 @@ def create_grids(
     width: int,
     output_path: Path,
 ) -> list[str]:
+    _check_output_name(output_path)
     max_per_grid = cols * (cols + 1)
     grid_files = []
 
-    for chunk_idx, start_idx in enumerate(range(0, len(slides), max_per_grid)):
-        end_idx = min(start_idx + max_per_grid, len(slides))
-        chunk_slides = slides[start_idx:end_idx]
+    dir_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for chunk_idx, start_idx in enumerate(range(0, len(slides), max_per_grid)):
+            end_idx = min(start_idx + max_per_grid, len(slides))
+            chunk_slides = slides[start_idx:end_idx]
 
-        grid = create_grid(chunk_slides, cols, width)
+            grid = create_grid(chunk_slides, cols, width)
 
-        if len(slides) <= max_per_grid:
-            grid_filename = output_path
-        else:
-            stem = output_path.stem
-            suffix = output_path.suffix
-            grid_filename = output_path.parent / f"{stem}-{chunk_idx + 1}{suffix}"
+            if len(slides) <= max_per_grid:
+                grid_filename = output_path.name
+            else:
+                stem = output_path.stem
+                suffix = output_path.suffix
+                grid_filename = f"{stem}-{chunk_idx + 1}{suffix}"
 
-        grid_filename.parent.mkdir(parents=True, exist_ok=True)
-        grid.save(str(grid_filename), quality=JPEG_QUALITY)
-        grid_files.append(str(grid_filename))
+            _write_grid(grid, grid_filename, dir_fd)
+            grid_files.append(grid_filename)
+    finally:
+        os.close(dir_fd)
 
     return grid_files
+
+
+def _check_output_name(output_path: Path) -> None:
+    name = output_path.name
+    if str(output_path) != name or name in ("", ".", ".."):
+        raise ValueError(
+            f"Output prefix must be a plain file name in the current directory: {output_path}"
+        )
+
+
+def _write_grid(grid: Image.Image, name: str, dir_fd: int) -> None:
+    # O_NOFOLLOW and the fstat checks keep the write on a regular file whose
+    # only directory entry is `name` in dir_fd, so a symlink or hard link
+    # planted there cannot redirect it.
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | os.O_NOCTTY
+        | os.O_CLOEXEC
+    )
+    fd = os.open(name, flags, 0o666, dir_fd=dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise ValueError(f"Refusing to overwrite {name}: not a single-link regular file")
+        os.ftruncate(fd, 0)
+        f = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
+        grid.save(f, format="JPEG", quality=JPEG_QUALITY)
 
 
 def create_grid(
