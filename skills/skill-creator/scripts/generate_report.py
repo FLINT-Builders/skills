@@ -159,8 +159,8 @@ def generate_html(data: dict, auto_refresh: bool = False, skill_name: str = "") 
     <div class="summary">
         <p><strong>Original:</strong> {html.escape(data.get('original_description', 'N/A'))}</p>
         <p class="best"><strong>Best:</strong> {html.escape(data.get('best_description', 'N/A'))}</p>
-        <p><strong>Best Score:</strong> {data.get('best_score', 'N/A')} {'(test)' if best_test_score else '(train)'}</p>
-        <p><strong>Iterations:</strong> {data.get('iterations_run', 0)} | <strong>Train:</strong> {data.get('train_size', '?')} | <strong>Test:</strong> {data.get('test_size', '?')}</p>
+        <p><strong>Best Score:</strong> {html.escape(str(data.get('best_score', 'N/A')))} {'(test)' if best_test_score else '(train)'}</p>
+        <p><strong>Iterations:</strong> {html.escape(str(data.get('iterations_run', 0)))} | <strong>Train:</strong> {html.escape(str(data.get('train_size', '?')))} | <strong>Test:</strong> {html.escape(str(data.get('test_size', '?')))}</p>
     </div>
 """)
 
@@ -256,7 +256,7 @@ def generate_html(data: dict, auto_refresh: bool = False, skill_name: str = "") 
         row_class = "best-row" if iteration == best_iter else ""
 
         html_parts.append(f"""            <tr class="{row_class}">
-                <td>{iteration}</td>
+                <td>{html.escape(str(iteration))}</td>
                 <td><span class="score {train_class}">{train_correct}/{train_runs}</span></td>
                 <td><span class="score {test_class}">{test_correct}/{test_runs}</span></td>
                 <td class="description">{html.escape(description)}</td>
@@ -272,7 +272,7 @@ def generate_html(data: dict, auto_refresh: bool = False, skill_name: str = "") 
             icon = "✓" if did_pass else "✗"
             css_class = "pass" if did_pass else "fail"
 
-            html_parts.append(f'                <td class="result {css_class}">{icon}<span class="rate">{triggers}/{runs}</span></td>\n')
+            html_parts.append(f'                <td class="result {css_class}">{icon}<span class="rate">{html.escape(f"{triggers}/{runs}")}</span></td>\n')
 
         # Add result for each test query (with different background)
         for qinfo in test_queries:
@@ -284,7 +284,7 @@ def generate_html(data: dict, auto_refresh: bool = False, skill_name: str = "") 
             icon = "✓" if did_pass else "✗"
             css_class = "pass" if did_pass else "fail"
 
-            html_parts.append(f'                <td class="result test-result {css_class}">{icon}<span class="rate">{triggers}/{runs}</span></td>\n')
+            html_parts.append(f'                <td class="result test-result {css_class}">{icon}<span class="rate">{html.escape(f"{triggers}/{runs}")}</span></td>\n')
 
         html_parts.append("            </tr>\n")
 
