@@ -19,6 +19,7 @@ import mimetypes
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -57,85 +58,236 @@ def get_mime_type(path: Path) -> str:
     return mime or "application/octet-stream"
 
 
+# Workspace contents are untrusted: every read and write below goes through a
+# directory file descriptor and opens the final component with O_NOFOLLOW, so
+# a symlink (or one swapped in mid-scan) can never point the viewer outside
+# the workspace.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", None)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+FD_SAFE_IO_SUPPORTED = (
+    _O_NOFOLLOW is not None
+    and _O_DIRECTORY is not None
+    and os.open in os.supports_dir_fd
+    and os.scandir in os.supports_fd
+)
+
+
+def _require_fd_safe_io() -> None:
+    if not FD_SAFE_IO_SUPPORTED:
+        raise OSError("generate_review.py requires O_NOFOLLOW and dir_fd support (POSIX)")
+
+
+def _open_dir_path(path: Path) -> int:
+    """Open a caller-chosen directory (symlinks in the path itself are trusted)."""
+    _require_fd_safe_io()
+    return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
+
+
+def _open_subdir(dir_fd: int, name: str) -> int | None:
+    """Open a real subdirectory of dir_fd; symlinks and non-directories yield None."""
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return None
+
+
+def _read_regular_file(dir_fd: int, name: str) -> bytes | None:
+    """Read a regular file inside dir_fd; symlinks and special files yield None.
+
+    Raises OSError only when the file was opened but could not be read.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        raise
+    with open(fd, "rb") as f:
+        return f.read()
+
+
+def _read_path_nofollow(path: Path) -> bytes | None:
+    """Read path if its final component is a regular file, not a symlink."""
+    try:
+        dir_fd = _open_dir_path(path.parent)
+    except OSError:
+        return None
+    try:
+        return _read_regular_file(dir_fd, path.name)
+    except OSError:
+        return None
+    finally:
+        os.close(dir_fd)
+
+
+def _write_path_nofollow(path: Path, data: bytes) -> None:
+    """Write path, refusing to follow a symlink or replace a non-regular file."""
+    dir_fd = _open_dir_path(path.parent)
+    try:
+        fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
+            0o644,
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        os.ftruncate(fd, 0)
+    except OSError:
+        os.close(fd)
+        raise
+    with open(fd, "wb") as f:
+        f.write(data)
+
+
+def _load_json_bytes(raw: bytes | None):
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
 def find_runs(workspace: Path) -> list[dict]:
     """Recursively find directories that contain an outputs/ subdirectory."""
     runs: list[dict] = []
-    _find_runs_recursive(workspace, workspace, runs)
-    runs.sort(key=lambda r: (r.get("eval_id", float("inf")), r["id"]))
+    try:
+        root_fd = _open_dir_path(workspace)
+    except OSError:
+        return runs
+    try:
+        _find_runs_recursive(root_fd, None, (), runs)
+    finally:
+        os.close(root_fd)
+    runs.sort(key=lambda r: (
+        float("inf") if r.get("eval_id") is None else r["eval_id"],
+        r["id"],
+    ))
     return runs
 
 
-def _find_runs_recursive(root: Path, current: Path, runs: list[dict]) -> None:
-    if not current.is_dir():
-        return
-
-    outputs_dir = current / "outputs"
-    if outputs_dir.is_dir():
-        run = build_run(root, current)
+def _find_runs_recursive(
+    dir_fd: int, parent_fd: int | None, rel_parts: tuple[str, ...], runs: list[dict]
+) -> None:
+    outputs_fd = _open_subdir(dir_fd, "outputs")
+    if outputs_fd is not None:
+        try:
+            run = build_run(rel_parts, dir_fd, parent_fd, outputs_fd)
+        finally:
+            os.close(outputs_fd)
         if run:
             runs.append(run)
         return
 
     skip = {"node_modules", ".git", "__pycache__", "skill", "inputs"}
-    for child in sorted(current.iterdir()):
-        if child.is_dir() and child.name not in skip:
-            _find_runs_recursive(root, child, runs)
+    try:
+        with os.scandir(dir_fd) as it:
+            names = sorted(
+                e.name for e in it if e.name not in skip and e.is_dir(follow_symlinks=False)
+            )
+    except OSError:
+        return
+    for name in names:
+        child_fd = _open_subdir(dir_fd, name)
+        if child_fd is None:
+            continue
+        try:
+            _find_runs_recursive(child_fd, dir_fd, rel_parts + (name,), runs)
+        finally:
+            os.close(child_fd)
 
 
-def build_run(root: Path, run_dir: Path) -> dict | None:
-    """Build a run dict with prompt, outputs, and grading data."""
+def build_run(
+    rel_parts: tuple[str, ...], run_fd: int, parent_fd: int | None, outputs_fd: int
+) -> dict | None:
+    """Build a run dict with prompt, outputs, and grading data.
+
+    parent_fd is None for a run at the workspace root, so nothing outside the
+    workspace is read.
+    """
     prompt = ""
     eval_id = None
+    run_and_parent = [fd for fd in (run_fd, parent_fd) if fd is not None]
 
     # Try eval_metadata.json
-    for candidate in [run_dir / "eval_metadata.json", run_dir.parent / "eval_metadata.json"]:
-        if candidate.exists():
-            try:
-                metadata = json.loads(candidate.read_text())
-                prompt = metadata.get("prompt", "")
-                eval_id = metadata.get("eval_id")
-            except (json.JSONDecodeError, OSError):
-                pass
-            if prompt:
-                break
+    for dir_fd in run_and_parent:
+        try:
+            raw = _read_regular_file(dir_fd, "eval_metadata.json")
+        except OSError:
+            continue
+        if raw is None:
+            continue
+        metadata = _load_json_bytes(raw)
+        if isinstance(metadata, dict):
+            prompt = metadata.get("prompt", "")
+            eval_id = metadata.get("eval_id")
+        if prompt:
+            break
 
     # Fall back to transcript.md
     if not prompt:
-        for candidate in [run_dir / "transcript.md", run_dir / "outputs" / "transcript.md"]:
-            if candidate.exists():
-                try:
-                    text = candidate.read_text()
-                    match = re.search(r"## Eval Prompt\n\n([\s\S]*?)(?=\n##|$)", text)
-                    if match:
-                        prompt = match.group(1).strip()
-                except OSError:
-                    pass
-                if prompt:
-                    break
+        for dir_fd in (run_fd, outputs_fd):
+            try:
+                raw = _read_regular_file(dir_fd, "transcript.md")
+            except OSError:
+                continue
+            if raw is None:
+                continue
+            text = raw.decode("utf-8", errors="replace")
+            match = re.search(r"## Eval Prompt\n\n([\s\S]*?)(?=\n##|$)", text)
+            if match:
+                prompt = match.group(1).strip()
+            if prompt:
+                break
 
     if not prompt:
         prompt = "(No prompt found)"
 
-    run_id = str(run_dir.relative_to(root)).replace("/", "-").replace("\\", "-")
+    run_id = "-".join(rel_parts) or "."
 
     # Collect output files
-    outputs_dir = run_dir / "outputs"
     output_files: list[dict] = []
-    if outputs_dir.is_dir():
-        for f in sorted(outputs_dir.iterdir()):
-            if f.is_file() and f.name not in METADATA_FILES:
-                output_files.append(embed_file(f))
+    try:
+        with os.scandir(outputs_fd) as it:
+            names = sorted(
+                e.name for e in it
+                if e.name not in METADATA_FILES and e.is_file(follow_symlinks=False)
+            )
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            raw = _read_regular_file(outputs_fd, name)
+        except OSError:
+            output_files.append({"name": name, "type": "error", "content": "(Error reading file)"})
+            continue
+        if raw is not None:
+            output_files.append(embed_file(name, raw))
 
     # Load grading if present
     grading = None
-    for candidate in [run_dir / "grading.json", run_dir.parent / "grading.json"]:
-        if candidate.exists():
-            try:
-                grading = json.loads(candidate.read_text())
-            except (json.JSONDecodeError, OSError):
-                pass
-            if grading:
-                break
+    for dir_fd in run_and_parent:
+        try:
+            grading = _load_json_bytes(_read_regular_file(dir_fd, "grading.json"))
+        except OSError:
+            grading = None
+        if grading:
+            break
 
     return {
         "id": run_id,
@@ -146,64 +298,43 @@ def build_run(root: Path, run_dir: Path) -> dict | None:
     }
 
 
-def embed_file(path: Path) -> dict:
-    """Read a file and return an embedded representation."""
+def embed_file(name: str, raw: bytes) -> dict:
+    """Return an embedded representation of a file's contents."""
+    path = Path(name)
     ext = path.suffix.lower()
     mime = get_mime_type(path)
 
     if ext in TEXT_EXTENSIONS:
-        try:
-            content = path.read_text(errors="replace")
-        except OSError:
-            content = "(Error reading file)"
         return {
-            "name": path.name,
+            "name": name,
             "type": "text",
-            "content": content,
+            "content": raw.decode("utf-8", errors="replace"),
         }
-    elif ext in IMAGE_EXTENSIONS:
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    if ext in IMAGE_EXTENSIONS:
         return {
-            "name": path.name,
+            "name": name,
             "type": "image",
             "mime": mime,
             "data_uri": f"data:{mime};base64,{b64}",
         }
     elif ext == ".pdf":
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
-            "name": path.name,
+            "name": name,
             "type": "pdf",
             "data_uri": f"data:{mime};base64,{b64}",
         }
     elif ext == ".xlsx":
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
-            "name": path.name,
+            "name": name,
             "type": "xlsx",
             "data_b64": b64,
         }
     else:
         # Binary / unknown — base64 download link
-        try:
-            raw = path.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-        except OSError:
-            return {"name": path.name, "type": "error", "content": "(Error reading file)"}
         return {
-            "name": path.name,
+            "name": name,
             "type": "binary",
             "mime": mime,
             "data_uri": f"data:{mime};base64,{b64}",
@@ -219,16 +350,15 @@ def load_previous_iteration(workspace: Path) -> dict[str, dict]:
 
     # Load feedback
     feedback_map: dict[str, str] = {}
-    feedback_path = workspace / "feedback.json"
-    if feedback_path.exists():
+    data = _load_json_bytes(_read_path_nofollow(workspace / "feedback.json"))
+    if isinstance(data, dict):
         try:
-            data = json.loads(feedback_path.read_text())
             feedback_map = {
                 r["run_id"]: r["feedback"]
                 for r in data.get("reviews", [])
                 if r.get("feedback", "").strip()
             }
-        except (json.JSONDecodeError, OSError, KeyError):
+        except (AttributeError, KeyError, TypeError):
             pass
 
     # Load runs (to get outputs)
@@ -334,11 +464,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # Regenerate HTML on each request (re-scans workspace for new outputs)
             runs = find_runs(self.workspace)
             benchmark = None
-            if self.benchmark_path and self.benchmark_path.exists():
-                try:
-                    benchmark = json.loads(self.benchmark_path.read_text())
-                except (json.JSONDecodeError, OSError):
-                    pass
+            if self.benchmark_path:
+                benchmark = _load_json_bytes(_read_path_nofollow(self.benchmark_path))
             html = generate_html(runs, self.skill_name, self.previous, benchmark)
             content = html.encode("utf-8")
             self.send_response(200)
@@ -347,9 +474,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         elif self.path == "/api/feedback":
-            data = b"{}"
-            if self.feedback_path.exists():
-                data = self.feedback_path.read_bytes()
+            data = _read_path_nofollow(self.feedback_path)
+            if data is None:
+                data = b"{}"
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -366,7 +493,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 if not isinstance(data, dict) or "reviews" not in data:
                     raise ValueError("Expected JSON object with 'reviews' key")
-                self.feedback_path.write_text(json.dumps(data, indent=2) + "\n")
+                _write_path_nofollow(
+                    self.feedback_path, (json.dumps(data, indent=2) + "\n").encode("utf-8")
+                )
                 resp = b'{"ok":true}'
                 self.send_response(200)
             except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -403,6 +532,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not FD_SAFE_IO_SUPPORTED:
+        print("Error: this platform lacks O_NOFOLLOW/dir_fd support required to read the "
+              "workspace safely", file=sys.stderr)
+        sys.exit(1)
+
     workspace = args.workspace.resolve()
     if not workspace.is_dir():
         print(f"Error: {workspace} is not a directory", file=sys.stderr)
@@ -420,13 +554,12 @@ def main() -> None:
     if args.previous_workspace:
         previous = load_previous_iteration(args.previous_workspace.resolve())
 
-    benchmark_path = args.benchmark.resolve() if args.benchmark else None
+    # absolute(), not resolve(): resolving would turn a symlinked benchmark.json
+    # into its target and bypass the O_NOFOLLOW read.
+    benchmark_path = args.benchmark.absolute() if args.benchmark else None
     benchmark = None
-    if benchmark_path and benchmark_path.exists():
-        try:
-            benchmark = json.loads(benchmark_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
+    if benchmark_path:
+        benchmark = _load_json_bytes(_read_path_nofollow(benchmark_path))
 
     if args.static:
         html = generate_html(runs, skill_name, previous, benchmark)
