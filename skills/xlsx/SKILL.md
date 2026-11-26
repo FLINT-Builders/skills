@@ -45,6 +45,11 @@ again. **JSON with an `error` key instead of a `status` means nothing was recalc
 only that case exits non-zero — `errors_found` exits 0, so never treat a clean exit as a clean
 workbook.
 
+`recalc.py` refuses a workbook, before touching it, when a sheet's used range (A1 to its
+furthest cell or declared dimension) exceeds 16,777,216 cells, or when merged cells,
+hyperlink ranges, and comment ranges together span more than 250,000 cells. Either usually
+means a stray cell far from the data; delete it or shrink the range, then rerun.
+
 **A green recalc proves your formulas *evaluate*, not that they are *right*.** An off-by-one
 range or a reference to the wrong row yields a clean, error-free file with wrong numbers.
 Write 2–3 formulas first and check they pull the values you expect, before building out a grid.
