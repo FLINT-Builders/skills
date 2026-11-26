@@ -40,6 +40,9 @@ TEXT_EXTENSIONS = {
 # Extensions we render as inline images
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
 
+# Largest feedback document the review server will read from a POST.
+MAX_FEEDBACK_BODY = 1024 * 1024
+
 # MIME type overrides for common types
 MIME_OVERRIDES = {
     ".svg": "image/svg+xml",
@@ -312,6 +315,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
     picks up new eval outputs without restarting the server.
     """
 
+    # The server handles one connection at a time; a client that stalls
+    # mid-request must not hold it indefinitely.
+    timeout = 10
+
     def __init__(
         self,
         workspace: Path,
@@ -358,10 +365,40 @@ class ReviewHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
+    def _refuse(self, code: int, message: str) -> None:
+        # The body is left unread, so the connection cannot carry another request.
+        self.close_connection = True
+        resp = json.dumps({"error": message}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(resp)
+
     def do_POST(self) -> None:
         if self.path == "/api/feedback":
-            length = int(self.headers.get("Content-Length", 0))
+            # Browsers only send application/json cross-site after a CORS
+            # preflight, which this server never approves.
+            content_type = self.headers.get("Content-Type", "")
+            if content_type.split(";", 1)[0].strip().lower() != "application/json":
+                self._refuse(415, "Content-Type must be application/json")
+                return
+            raw_length = self.headers.get("Content-Length", "").strip()
+            if not (raw_length.isascii() and raw_length.isdigit()):
+                self._refuse(411, "A valid Content-Length is required")
+                return
+            raw_length = raw_length.lstrip("0") or "0"
+            # Compare digit counts first so an enormous value never reaches int().
+            if len(raw_length) > len(str(MAX_FEEDBACK_BODY)) or int(raw_length) > MAX_FEEDBACK_BODY:
+                self._refuse(413, f"Feedback body exceeds {MAX_FEEDBACK_BODY} bytes")
+                return
+            length = int(raw_length)
             body = self.rfile.read(length)
+            if len(body) != length:
+                # The client closed the connection before sending the full body.
+                self.close_connection = True
+                return
             try:
                 data = json.loads(body)
                 if not isinstance(data, dict) or "reviews" not in data:
@@ -377,6 +414,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(resp)
         else:
+            self.close_connection = True
             self.send_error(404)
 
     def log_message(self, format: str, *args: object) -> None:
