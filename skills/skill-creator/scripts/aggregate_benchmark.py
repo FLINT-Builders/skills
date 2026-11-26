@@ -35,11 +35,97 @@ The script supports two directory layouts:
 """
 
 import argparse
+import fnmatch
 import json
 import math
+import os
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Run directories are untrusted: walk them through directory file descriptors
+# and open every entry with O_NOFOLLOW so a symlink (or one swapped in
+# mid-scan) cannot pull files from outside the benchmark directory into
+# benchmark.json, or redirect its writes.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", None)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _require_fd_safe_io() -> None:
+    if (
+        _O_NOFOLLOW is None
+        or _O_DIRECTORY is None
+        or os.open not in os.supports_dir_fd
+        or os.scandir not in os.supports_fd
+    ):
+        raise OSError("aggregate_benchmark.py requires O_NOFOLLOW and dir_fd support (POSIX)")
+
+
+def _open_dir_path(path: Path) -> int:
+    _require_fd_safe_io()
+    return os.open(path, os.O_RDONLY | _O_DIRECTORY | _O_CLOEXEC)
+
+
+def _open_subdir(dir_fd: int, name: str) -> int | None:
+    try:
+        return os.open(
+            name,
+            os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        return None
+
+
+def _subdir_names(dir_fd: int, pattern: str = "*") -> list[str]:
+    with os.scandir(dir_fd) as it:
+        return sorted(
+            e.name for e in it
+            if fnmatch.fnmatchcase(e.name, pattern) and e.is_dir(follow_symlinks=False)
+        )
+
+
+def _read_regular_file(dir_fd: int, name: str) -> bytes | None:
+    """Read a regular file inside dir_fd; symlinks and special files yield None."""
+    try:
+        fd = os.open(name, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        raise
+    with open(fd, "rb") as f:
+        return f.read()
+
+
+def _write_path_nofollow(path: Path, data: bytes) -> None:
+    """Write path, refusing to follow a symlink or replace a non-regular file."""
+    dir_fd = _open_dir_path(path.parent)
+    try:
+        fd = os.open(
+            path.name,
+            os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC,
+            0o644,
+            dir_fd=dir_fd,
+        )
+    finally:
+        os.close(dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        os.ftruncate(fd, 0)
+    except OSError:
+        os.close(fd)
+        raise
+    with open(fd, "wb") as f:
+        f.write(data)
 
 
 def calculate_stats(values: list[float]) -> dict:
@@ -71,106 +157,146 @@ def load_run_results(benchmark_dir: Path) -> dict:
     Returns dict keyed by config name (e.g. "with_skill"/"without_skill",
     or "new_skill"/"old_skill"), each containing a list of run results.
     """
-    # Support both layouts: eval dirs directly under benchmark_dir, or under runs/
-    runs_dir = benchmark_dir / "runs"
-    if runs_dir.exists():
-        search_dir = runs_dir
-    elif list(benchmark_dir.glob("eval-*")):
-        search_dir = benchmark_dir
-    else:
-        print(f"No eval directories found in {benchmark_dir} or {benchmark_dir / 'runs'}")
-        return {}
+    root_fd = _open_dir_path(benchmark_dir)
+    try:
+        return _load_run_results(benchmark_dir, root_fd)
+    finally:
+        os.close(root_fd)
 
+
+def _load_run_results(benchmark_dir: Path, root_fd: int) -> dict:
+    # Support both layouts: eval dirs directly under benchmark_dir, or under runs/
+    runs_fd = _open_subdir(root_fd, "runs")
+    if runs_fd is not None:
+        try:
+            return _load_eval_dirs(benchmark_dir / "runs", runs_fd)
+        finally:
+            os.close(runs_fd)
+    if _subdir_names(root_fd, "eval-*"):
+        return _load_eval_dirs(benchmark_dir, root_fd)
+    print(f"No eval directories found in {benchmark_dir} or {benchmark_dir / 'runs'}")
+    return {}
+
+
+def _load_eval_dirs(search_dir: Path, search_fd: int) -> dict:
     results: dict[str, list] = {}
 
-    for eval_idx, eval_dir in enumerate(sorted(search_dir.glob("eval-*"))):
-        metadata_path = eval_dir / "eval_metadata.json"
-        if metadata_path.exists():
-            try:
-                with open(metadata_path) as mf:
-                    eval_id = json.load(mf).get("eval_id", eval_idx)
-            except (json.JSONDecodeError, OSError):
-                eval_id = eval_idx
-        else:
-            try:
-                eval_id = int(eval_dir.name.split("-")[1])
-            except ValueError:
-                eval_id = eval_idx
-
-        # Discover config directories dynamically rather than hardcoding names
-        for config_dir in sorted(eval_dir.iterdir()):
-            if not config_dir.is_dir():
-                continue
-            # Skip non-config directories (inputs, outputs, etc.)
-            if not list(config_dir.glob("run-*")):
-                continue
-            config = config_dir.name
-            if config not in results:
-                results[config] = []
-
-            for run_dir in sorted(config_dir.glob("run-*")):
-                run_number = int(run_dir.name.split("-")[1])
-                grading_file = run_dir / "grading.json"
-
-                if not grading_file.exists():
-                    print(f"Warning: grading.json not found in {run_dir}")
-                    continue
-
-                try:
-                    with open(grading_file) as f:
-                        grading = json.load(f)
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Invalid JSON in {grading_file}: {e}")
-                    continue
-
-                # Extract metrics
-                result = {
-                    "eval_id": eval_id,
-                    "run_number": run_number,
-                    "pass_rate": grading.get("summary", {}).get("pass_rate", 0.0),
-                    "passed": grading.get("summary", {}).get("passed", 0),
-                    "failed": grading.get("summary", {}).get("failed", 0),
-                    "total": grading.get("summary", {}).get("total", 0),
-                }
-
-                # Extract timing — check grading.json first, then sibling timing.json
-                timing = grading.get("timing", {})
-                result["time_seconds"] = timing.get("total_duration_seconds", 0.0)
-                timing_file = run_dir / "timing.json"
-                if result["time_seconds"] == 0.0 and timing_file.exists():
-                    try:
-                        with open(timing_file) as tf:
-                            timing_data = json.load(tf)
-                        result["time_seconds"] = timing_data.get("total_duration_seconds", 0.0)
-                        result["tokens"] = timing_data.get("total_tokens", 0)
-                    except json.JSONDecodeError:
-                        pass
-
-                # Extract metrics if available
-                metrics = grading.get("execution_metrics", {})
-                result["tool_calls"] = metrics.get("total_tool_calls", 0)
-                if not result.get("tokens"):
-                    result["tokens"] = metrics.get("output_chars", 0)
-                result["errors"] = metrics.get("errors_encountered", 0)
-
-                # Extract expectations — viewer requires fields: text, passed, evidence
-                raw_expectations = grading.get("expectations", [])
-                for exp in raw_expectations:
-                    if "text" not in exp or "passed" not in exp:
-                        print(f"Warning: expectation in {grading_file} missing required fields (text, passed, evidence): {exp}")
-                result["expectations"] = raw_expectations
-
-                # Extract notes from user_notes_summary
-                notes_summary = grading.get("user_notes_summary", {})
-                notes = []
-                notes.extend(notes_summary.get("uncertainties", []))
-                notes.extend(notes_summary.get("needs_review", []))
-                notes.extend(notes_summary.get("workarounds", []))
-                result["notes"] = notes
-
-                results[config].append(result)
+    for eval_idx, eval_name in enumerate(_subdir_names(search_fd, "eval-*")):
+        eval_fd = _open_subdir(search_fd, eval_name)
+        if eval_fd is None:
+            continue
+        try:
+            _load_eval_dir(search_dir / eval_name, eval_fd, eval_idx, results)
+        finally:
+            os.close(eval_fd)
 
     return results
+
+
+def _load_eval_dir(eval_dir: Path, eval_fd: int, eval_idx: int, results: dict) -> None:
+    try:
+        metadata_raw = _read_regular_file(eval_fd, "eval_metadata.json")
+    except OSError:
+        metadata_raw = b""
+    if metadata_raw is not None:
+        try:
+            eval_id = json.loads(metadata_raw).get("eval_id", eval_idx)
+        except ValueError:
+            eval_id = eval_idx
+    else:
+        try:
+            eval_id = int(eval_dir.name.split("-")[1])
+        except ValueError:
+            eval_id = eval_idx
+
+    # Discover config directories dynamically rather than hardcoding names
+    for config in _subdir_names(eval_fd):
+        config_fd = _open_subdir(eval_fd, config)
+        if config_fd is None:
+            continue
+        try:
+            run_names = _subdir_names(config_fd, "run-*")
+            # Skip non-config directories (inputs, outputs, etc.)
+            if not run_names:
+                continue
+            if config not in results:
+                results[config] = []
+            for run_name in run_names:
+                run_fd = _open_subdir(config_fd, run_name)
+                if run_fd is None:
+                    continue
+                try:
+                    result = _load_run(eval_dir / config / run_name, run_fd, eval_id)
+                finally:
+                    os.close(run_fd)
+                if result is not None:
+                    results[config].append(result)
+        finally:
+            os.close(config_fd)
+
+
+def _load_run(run_dir: Path, run_fd: int, eval_id) -> dict | None:
+    run_number = int(run_dir.name.split("-")[1])
+    grading_file = run_dir / "grading.json"
+
+    grading_raw = _read_regular_file(run_fd, "grading.json")
+    if grading_raw is None:
+        print(f"Warning: grading.json not found in {run_dir}")
+        return None
+
+    try:
+        grading = json.loads(grading_raw)
+    except ValueError as e:
+        print(f"Warning: Invalid JSON in {grading_file}: {e}")
+        return None
+
+    # Extract metrics
+    result = {
+        "eval_id": eval_id,
+        "run_number": run_number,
+        "pass_rate": grading.get("summary", {}).get("pass_rate", 0.0),
+        "passed": grading.get("summary", {}).get("passed", 0),
+        "failed": grading.get("summary", {}).get("failed", 0),
+        "total": grading.get("summary", {}).get("total", 0),
+    }
+
+    # Extract timing — check grading.json first, then sibling timing.json
+    timing = grading.get("timing", {})
+    result["time_seconds"] = timing.get("total_duration_seconds", 0.0)
+    timing_raw = None
+    if result["time_seconds"] == 0.0:
+        timing_raw = _read_regular_file(run_fd, "timing.json")
+    if timing_raw is not None:
+        try:
+            timing_data = json.loads(timing_raw)
+            result["time_seconds"] = timing_data.get("total_duration_seconds", 0.0)
+            result["tokens"] = timing_data.get("total_tokens", 0)
+        except ValueError:
+            pass
+
+    # Extract metrics if available
+    metrics = grading.get("execution_metrics", {})
+    result["tool_calls"] = metrics.get("total_tool_calls", 0)
+    if not result.get("tokens"):
+        result["tokens"] = metrics.get("output_chars", 0)
+    result["errors"] = metrics.get("errors_encountered", 0)
+
+    # Extract expectations — viewer requires fields: text, passed, evidence
+    raw_expectations = grading.get("expectations", [])
+    for exp in raw_expectations:
+        if "text" not in exp or "passed" not in exp:
+            print(f"Warning: expectation in {grading_file} missing required fields (text, passed, evidence): {exp}")
+    result["expectations"] = raw_expectations
+
+    # Extract notes from user_notes_summary
+    notes_summary = grading.get("user_notes_summary", {})
+    notes = []
+    notes.extend(notes_summary.get("uncertainties", []))
+    notes.extend(notes_summary.get("needs_review", []))
+    notes.extend(notes_summary.get("workarounds", []))
+    result["notes"] = notes
+
+    return result
 
 
 def aggregate_results(results: dict) -> dict:
@@ -374,14 +500,12 @@ def main():
     output_md = output_json.with_suffix(".md")
 
     # Write benchmark.json
-    with open(output_json, "w") as f:
-        json.dump(benchmark, f, indent=2)
+    _write_path_nofollow(output_json, json.dumps(benchmark, indent=2).encode("utf-8"))
     print(f"Generated: {output_json}")
 
     # Write benchmark.md
     markdown = generate_markdown(benchmark)
-    with open(output_md, "w") as f:
-        f.write(markdown)
+    _write_path_nofollow(output_md, markdown.encode("utf-8"))
     print(f"Generated: {output_md}")
 
     # Print summary
