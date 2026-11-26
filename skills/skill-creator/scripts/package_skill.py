@@ -11,7 +11,10 @@ Example:
 """
 
 import fnmatch
+import os
+import stat
 import sys
+import time
 import zipfile
 from pathlib import Path
 from scripts.quick_validate import validate_skill
@@ -37,6 +40,35 @@ def should_exclude(rel_path: Path) -> bool:
     if name in EXCLUDE_FILES:
         return True
     return any(fnmatch.fnmatch(name, pat) for pat in EXCLUDE_GLOBS)
+
+
+def _iter_skill_files(skill_path: Path):
+    """Yield (relative path, fd) for each regular file under skill_path.
+
+    Symlinks are never followed: fwalk does not descend into linked
+    directories, and each file is opened with O_NOFOLLOW relative to its
+    directory fd, so a link cannot pull files from outside the skill into the
+    package. The caller owns and must close each yielded fd.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None or not hasattr(os, "fwalk"):
+        raise OSError("packaging requires os.fwalk and O_NOFOLLOW (POSIX)")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    for dirpath, _dirnames, filenames, dir_fd in os.fwalk(skill_path, follow_symlinks=False):
+        rel_dir = Path(dirpath).relative_to(skill_path)
+        for name in sorted(filenames):
+            try:
+                fd = os.open(name, flags, dir_fd=dir_fd)
+            except OSError:
+                continue
+            try:
+                is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+            except OSError:
+                is_regular = False
+            if not is_regular:
+                os.close(fd)
+                continue
+            yield rel_dir / name, fd
 
 
 def package_skill(skill_path, output_dir=None):
@@ -90,14 +122,17 @@ def package_skill(skill_path, output_dir=None):
     try:
         with zipfile.ZipFile(skill_filename, 'w', zipfile.ZIP_DEFLATED) as zipf:
             # Walk through the skill directory, excluding build artifacts
-            for file_path in skill_path.rglob('*'):
-                if not file_path.is_file():
-                    continue
-                arcname = file_path.relative_to(skill_path.parent)
-                if should_exclude(arcname):
-                    print(f"  Skipped: {arcname}")
-                    continue
-                zipf.write(file_path, arcname)
+            for rel_path, fd in _iter_skill_files(skill_path):
+                with open(fd, "rb") as f:
+                    arcname = Path(skill_name) / rel_path
+                    if should_exclude(arcname):
+                        print(f"  Skipped: {arcname}")
+                        continue
+                    st = os.fstat(f.fileno())
+                    info = zipfile.ZipInfo(str(arcname), time.localtime(st.st_mtime)[:6])
+                    info.external_attr = (st.st_mode & 0xFFFF) << 16
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    zipf.writestr(info, f.read())
                 print(f"  Added: {arcname}")
 
         print(f"\n✅ Successfully packaged skill to: {skill_filename}")
