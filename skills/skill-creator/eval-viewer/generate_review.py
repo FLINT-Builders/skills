@@ -49,6 +49,16 @@ MIME_OVERRIDES = {
 }
 
 
+def json_for_script(value: object) -> str:
+    """Serialize value as JSON that is safe to place inside an HTML <script>."""
+    return (
+        json.dumps(value)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
 def get_mime_type(path: Path) -> str:
     ext = path.suffix.lower()
     if ext in MIME_OVERRIDES:
@@ -276,9 +286,11 @@ def generate_html(
     if benchmark:
         embedded["benchmark"] = benchmark
 
-    data_json = json.dumps(embedded)
+    data_json = json_for_script(embedded)
 
-    return template.replace("/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};")
+    return template.replace(
+        "/*__EMBEDDED_DATA__*/", f"const EMBEDDED_DATA = {data_json};", 1
+    )
 
 
 # ---------------------------------------------------------------------------
