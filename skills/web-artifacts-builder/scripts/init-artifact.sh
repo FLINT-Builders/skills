@@ -3,6 +3,28 @@
 # Exit on error
 set -e
 
+# Check if project name is provided
+if [ -z "$1" ]; then
+  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
+  exit 1
+fi
+
+# The name is used as a directory, a package name, and HTML text, so only a
+# plain ASCII slug is accepted, and it is checked before anything else runs.
+# LC_ALL=C keeps the bracket ranges from matching non-ASCII letters.
+is_safe_project_name() {
+  local LC_ALL=C
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,213}$ ]]
+}
+
+if ! is_safe_project_name "$1"; then
+  echo "❌ Error: project name must contain only letters, digits, and hyphens,"
+  echo "   start with a letter or digit, and be at most 214 characters long."
+  exit 1
+fi
+
+readonly PROJECT_NAME="$1"
+
 # Detect Node version
 NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
 
@@ -23,26 +45,12 @@ else
   echo "✅ Using Vite $VITE_VERSION (Node 18 compatible)"
 fi
 
-# Detect OS and set sed syntax
-if [[ "$OSTYPE" == "darwin"* ]]; then
-  SED_INPLACE="sed -i ''"
-else
-  SED_INPLACE="sed -i"
-fi
-
 # Check if pnpm is installed
 if ! command -v pnpm &> /dev/null; then
   echo "📦 pnpm not found. Installing pnpm..."
   npm install -g pnpm
 fi
 
-# Check if project name is provided
-if [ -z "$1" ]; then
-  echo "❌ Usage: ./create-react-shadcn-complete.sh <project-name>"
-  exit 1
-fi
-
-PROJECT_NAME="$1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPONENTS_TARBALL="$SCRIPT_DIR/shadcn-components.tar.gz"
 
@@ -53,7 +61,7 @@ if [ ! -f "$COMPONENTS_TARBALL" ]; then
   exit 1
 fi
 
-echo "🚀 Creating new React + Vite project: $PROJECT_NAME"
+printf '🚀 Creating new React + Vite project: %s\n' "$PROJECT_NAME"
 
 # Create new Vite project (always use latest create-vite, pin vite version later)
 pnpm create vite "$PROJECT_NAME" --template react-ts
@@ -62,8 +70,16 @@ pnpm create vite "$PROJECT_NAME" --template react-ts
 cd "$PROJECT_NAME"
 
 echo "🧹 Cleaning up Vite template..."
-$SED_INPLACE '/<link rel="icon".*vite\.svg/d' index.html
-$SED_INPLACE 's/<title>.*<\/title>/<title>'"$PROJECT_NAME"'<\/title>/' index.html
+node -e '
+const fs = require("fs");
+const title = process.argv[1];
+const html = fs.readFileSync("index.html", "utf8")
+  .split("\n")
+  .filter((line) => !/<link rel="icon".*vite\.svg/.test(line))
+  .join("\n")
+  .replace(/<title>.*<\/title>/, () => "<title>" + title + "</title>");
+fs.writeFileSync("index.html", html);
+' "$PROJECT_NAME"
 
 echo "📦 Installing base dependencies..."
 pnpm install
@@ -313,7 +329,7 @@ echo "  - select, separator, sheet, skeleton, slider, sonner"
 echo "  - switch, table, tabs, textarea, toast, toggle, toggle-group, tooltip"
 echo ""
 echo "To start developing:"
-echo "  cd $PROJECT_NAME"
+printf '  cd %s\n' "$PROJECT_NAME"
 echo "  pnpm dev"
 echo ""
 echo "📚 Import components like:"
